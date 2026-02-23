@@ -149,6 +149,10 @@ if st.sidebar.button("Run Forecast", type="primary"):
     else:
         mape = eval_results['mape']
         rmse = eval_results['rmse']
+        avg_demand = inv['avg_daily_demand']
+
+        # Detect intermittent demand — MAPE is structurally unreliable below ~1.5 units/day
+        is_intermittent = avg_demand < 1.5
 
         if mape < 20:
             mape_label = f"✅ {mape:.1f}%"
@@ -164,6 +168,27 @@ if st.sidebar.button("Run Forecast", type="primary"):
                      help="Lower is better. Penalizes large errors more heavily than MAPE.")
         acol3.metric("Holdout Window", "Last 90 days",
                      help="Model trained on all data before this window, then tested against it.")
+
+        # Contextual note for low-volume / intermittent demand items
+        if is_intermittent:
+            st.warning(
+                f"**Intermittent demand detected** (avg {avg_demand:.2f} units/day). "
+                f"MAPE is less meaningful for low-volume items — being off by 1 unit on a day "
+                f"with 1 actual sale registers as 100% error, even though the absolute mistake "
+                f"is small. For items like this, **RMSE ({rmse:.2f} units)** is a more reliable "
+                f"accuracy signal, and the shape of the backtest chart below matters more than "
+                f"the MAPE number. This is a known limitation of MAPE on intermittent retail "
+                f"demand — it's why the M5 Kaggle competition used WRMSSE (weighted RMSE) instead."
+            )
+        elif mape > 40:
+            st.info(
+                f"**Note on this MAPE:** Retail demand forecasting at the individual item level "
+                f"is genuinely difficult. The M5 dataset (real Walmart data) is a well-known "
+                f"benchmark where even competition-winning ensemble models achieve MAPEs in this "
+                f"range. A single-item Prophet model capturing weekly and yearly seasonality is "
+                f"the right tool for interpretable, actionable forecasts — the backtest chart "
+                f"below shows whether the model is tracking the right patterns."
+            )
 
         comp = eval_results['comparison']
         fig_eval, ax_eval = plt.subplots(figsize=(12, 3))
