@@ -7,8 +7,9 @@ import os
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from pipeline import (load_data, get_single_item, prepare_prophet_df,
-                      train_forecast, calculate_inventory,
-                      STORE_LABELS, CATEGORY_LABELS, DEPT_LABELS)
+                      train_forecast, evaluate_forecast, calculate_inventory,
+                      STORE_LABELS, STORES_BY_STATE, STATE_LABELS,
+                      STORE_SHORT_LABELS, CATEGORY_LABELS, DEPT_LABELS)
 
 # ── Page Config ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="Demand Forecast & Inventory Optimizer",
@@ -17,51 +18,95 @@ st.set_page_config(page_title="Demand Forecast & Inventory Optimizer",
 st.title("Demand Forecast & Inventory Optimization Pipeline")
 st.markdown("Built with Prophet forecasting and ISE inventory principles.")
 
-# ── Sidebar Controls ──────────────────────────────────────────────────────
-st.sidebar.header("Product Selection")
-
+# ── Load Data ─────────────────────────────────────────────────────────────
 @st.cache_data
 def load_cached_data():
     df = load_data('data/sales_clean.parquet')
-    # Keep only necessary columns to reduce memory
     return df[['item_id', 'store_id', 'state_id',
                 'cat_id', 'dept_id', 'date', 'sales', 'sell_price']]
 
 sales_clean = load_cached_data()
 
-# Build readable product list
-product_df = sales_clean[['item_id', 'cat_id', 'dept_id']].drop_duplicates()
-product_df['label'] = (product_df['cat_id'].map(CATEGORY_LABELS) +
-                       ' | ' + product_df['item_id'])
-product_df = product_df.sort_values('label')
+# ── Precompute avg demand per item for sorting the product dropdown ────────
+@st.cache_data
+def get_product_demand_summary(df):
+    """Avg daily demand per item across all stores — used for sorting only."""
+    summary = (
+        df.groupby(['item_id', 'cat_id', 'dept_id'])['sales']
+        .mean()
+        .reset_index()
+        .rename(columns={'sales': 'avg_daily_demand'})
+    )
+    return summary
 
-store_options = {v: k for k, v in STORE_LABELS.items()}
-store_labels = sorted(STORE_LABELS.values())
+demand_summary = get_product_demand_summary(sales_clean)
 
+# ── Sidebar: Cascading Product Selection ──────────────────────────────────
+st.sidebar.header("Product Selection")
+
+# Step 1 — Category
+st.sidebar.subheader("Category")
+category_options = sorted(CATEGORY_LABELS.values())
+selected_category_label = st.sidebar.selectbox(
+    "Category", category_options, label_visibility="collapsed")
+selected_cat_id = {v: k for k, v in CATEGORY_LABELS.items()}[selected_category_label]
+
+# Step 2 — Department (filtered to selected category)
+st.sidebar.subheader("Department")
+dept_options_raw = sorted([k for k in DEPT_LABELS if k.startswith(selected_cat_id)])
+dept_options_labels = [DEPT_LABELS[d] for d in dept_options_raw]
+selected_dept_label = st.sidebar.selectbox(
+    "Department", dept_options_labels, label_visibility="collapsed")
+selected_dept_id = {v: k for k, v in DEPT_LABELS.items()}[selected_dept_label]
+
+# Step 3 — Product (filtered to dept, sorted by avg demand descending)
+st.sidebar.subheader("Product  (sorted by avg demand ↓)")
+dept_products = demand_summary[demand_summary['dept_id'] == selected_dept_id].copy()
+dept_products = dept_products.sort_values('avg_daily_demand', ascending=False)
+dept_products['label'] = (
+    dept_products['item_id'] +
+    "  —  " +
+    dept_products['avg_daily_demand'].map(lambda x: f"{x:.2f} units/day")
+)
 selected_product_label = st.sidebar.selectbox(
-    "Select Product", product_df['label'].tolist())
-selected_store_label = st.sidebar.selectbox(
-    "Select Store", store_labels)
+    "Product", dept_products['label'].tolist(), label_visibility="collapsed")
+product_id = dept_products[
+    dept_products['label'] == selected_product_label]['item_id'].values[0]
+cat_id = selected_cat_id
 
-product_id = product_df[product_df['label'] ==
-                         selected_product_label]['item_id'].values[0]
-store_id = store_options[selected_store_label]
-cat_id = product_df[product_df['label'] ==
-                     selected_product_label]['cat_id'].values[0]
+# ── Sidebar: Cascading Store Selection ────────────────────────────────────
+st.sidebar.header("Store Selection")
 
+# Step 1 — State
+st.sidebar.subheader("State")
+state_options = sorted(STATE_LABELS.values())
+selected_state_label = st.sidebar.selectbox(
+    "State", state_options, label_visibility="collapsed")
+selected_state_id = {v: k for k, v in STATE_LABELS.items()}[selected_state_label]
+
+# Step 2 — Store (filtered to selected state)
+st.sidebar.subheader("Store")
+store_ids_in_state = STORES_BY_STATE[selected_state_id]
+store_short_options = [STORE_SHORT_LABELS[s] for s in store_ids_in_state]
+selected_store_short = st.sidebar.selectbox(
+    "Store", store_short_options, label_visibility="collapsed")
+store_id = store_ids_in_state[store_short_options.index(selected_store_short)]
+selected_store_label = STORE_LABELS[store_id]  # full label, e.g. "California - Store 1"
+
+# ── Sidebar: Inventory Parameters ────────────────────────────────────────
 st.sidebar.header("Inventory Parameters")
 lead_time = st.sidebar.slider("Lead Time (days)", 1, 30, 7)
 ordering_cost = st.sidebar.slider("Ordering Cost ($)", 1, 100, 10)
 holding_cost = st.sidebar.slider("Holding Cost (% of price/year)", 0.05, 0.50, 0.20)
 forecast_days = st.sidebar.slider("Forecast Horizon (days)", 30, 180, 90)
 
-# ── Cache the forecast so it doesn't retrain on every interaction ─────────
+# ── Cached Pipeline ───────────────────────────────────────────────────────
 @st.cache_data
 def run_pipeline(product_id, store_id, forecast_days,
                  lead_time, ordering_cost, holding_cost):
     item_df = get_single_item(sales_clean, product_id, store_id)
     if len(item_df) < 30:
-        return None, None, None, None
+        return None, None, None, None, None
     df_prophet = prepare_prophet_df(item_df)
     forecast = train_forecast(df_prophet, forecast_days)
     avg_price = item_df['sell_price'].mean()
@@ -69,13 +114,14 @@ def run_pipeline(product_id, store_id, forecast_days,
                               lead_time_days=lead_time,
                               holding_cost=holding_cost,
                               ordering_cost=ordering_cost)
-    return item_df, df_prophet, forecast, inv
+    eval_results = evaluate_forecast(df_prophet, holdout_days=90)
+    return item_df, df_prophet, forecast, inv, eval_results
 
-# ── Run Pipeline ──────────────────────────────────────────────────────────
+# ── Run ───────────────────────────────────────────────────────────────────
 if st.sidebar.button("Run Forecast", type="primary"):
 
     with st.spinner("Training forecast model... this may take a moment"):
-        item_df, df_prophet, forecast, inv = run_pipeline(
+        item_df, df_prophet, forecast, inv, eval_results = run_pipeline(
             product_id, store_id, forecast_days,
             lead_time, ordering_cost, holding_cost)
 
@@ -94,6 +140,53 @@ if st.sidebar.button("Run Forecast", type="primary"):
     col2.metric("Safety Stock", f"{inv['safety_stock']:.1f} units")
     col3.metric("Reorder Point", f"{inv['rop']:.1f} units")
     col4.metric("EOQ", f"{inv['eoq']:.1f} units")
+
+    # ── Model Accuracy ────────────────────────────────────────────────────
+    st.subheader("Model Accuracy (90-Day Holdout Backtest)")
+
+    if eval_results is None:
+        st.warning("Not enough historical data to run a backtest for this item.")
+    else:
+        mape = eval_results['mape']
+        rmse = eval_results['rmse']
+
+        if mape < 20:
+            mape_label = f"✅ {mape:.1f}%"
+        elif mape < 40:
+            mape_label = f"⚠️ {mape:.1f}%"
+        else:
+            mape_label = f"🔴 {mape:.1f}%"
+
+        acol1, acol2, acol3 = st.columns(3)
+        acol1.metric("MAPE (Mean Abs % Error)", mape_label,
+                     help="Lower is better. Measures average % error on days with non-zero sales.")
+        acol2.metric("RMSE (Root Mean Sq Error)", f"{rmse:.2f} units",
+                     help="Lower is better. Penalizes large errors more heavily than MAPE.")
+        acol3.metric("Holdout Window", "Last 90 days",
+                     help="Model trained on all data before this window, then tested against it.")
+
+        comp = eval_results['comparison']
+        fig_eval, ax_eval = plt.subplots(figsize=(12, 3))
+        ax_eval.plot(comp['ds'], comp['y'],
+                     color='steelblue', label='Actual Sales', alpha=0.7)
+        ax_eval.plot(comp['ds'], comp['yhat'],
+                     color='red', linewidth=2, label='Model Prediction')
+        ax_eval.fill_between(comp['ds'], comp['yhat_lower'], comp['yhat_upper'],
+                             alpha=0.15, color='red', label='Uncertainty Band')
+        ax_eval.set_title(
+            f'Backtest: Actual vs Predicted (last 90 days) — MAPE: {mape:.1f}%')
+        ax_eval.set_xlabel('Date')
+        ax_eval.set_ylabel('Units Sold')
+        ax_eval.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig_eval)
+
+        st.caption(
+            "The backtest trains the model on all data *except* the last 90 days, "
+            "then forecasts that window and compares to what actually happened. "
+            "This gives an honest estimate of how accurate future forecasts will be."
+        )
 
     # ── Forecast Insights ─────────────────────────────────────────────────
     st.subheader("Forecast Insights")
@@ -122,8 +215,6 @@ if st.sidebar.button("Run Forecast", type="primary"):
     st.subheader("Demand Forecast")
 
     fig1, ax1 = plt.subplots(figsize=(12, 4))
-
-    # Only show last 180 days of history to make chart cleaner
     recent_history = df_prophet.tail(180)
     ax1.plot(recent_history['ds'], recent_history['y'],
              color='steelblue', alpha=0.5, label='Historical Sales (last 180 days)')
@@ -133,12 +224,9 @@ if st.sidebar.button("Run Forecast", type="primary"):
                      future_f['yhat_lower'],
                      future_f['yhat_upper'],
                      alpha=0.2, color='red', label='Uncertainty Band')
-
-    # Mark peak demand day
     ax1.axvline(x=peak_day['ds'], color='orange',
-                linestyle='--', alpha=0.7, label=f"Peak Day")
-
-    ax1.set_title(f'Demand Forecast - {product_id} at {selected_store_label}')
+                linestyle='--', alpha=0.7, label="Peak Day")
+    ax1.set_title(f'Demand Forecast — {product_id} at {selected_store_label}')
     ax1.set_xlabel('Date')
     ax1.set_ylabel('Units Sold')
     ax1.legend()
@@ -150,22 +238,21 @@ if st.sidebar.button("Run Forecast", type="primary"):
     st.subheader("Summary")
     st.info(f"""
     **What this means for {product_id}:**
-    - Over the next **{forecast_days} days**, expect to sell approximately **{total_forecast:.0f} units** 
+    - Over the next **{forecast_days} days**, expect to sell approximately **{total_forecast:.0f} units**
       at {selected_store_label}.
-    - Demand peaks around **{peak_day['ds'].strftime('%B %d, %Y')}** 
+    - Demand peaks around **{peak_day['ds'].strftime('%B %d, %Y')}**
       at {peak_day['yhat']:.1f} units/day.
-    - To maintain a **95% service level**, keep at least **{inv['safety_stock']:.0f} units** 
+    - To maintain a **95% service level**, keep at least **{inv['safety_stock']:.0f} units**
       as safety stock.
-    - Place a new order when inventory hits **{inv['rop']:.0f} units** 
+    - Place a new order when inventory hits **{inv['rop']:.0f} units**
       (covers {lead_time} day lead time + safety stock).
     - Order **{inv['eoq']:.0f} units** at a time to minimize total inventory costs.
     """)
 
-    # ── Inventory Simulation Chart ────────────────────────────────────────
+    # ── Inventory Simulation ──────────────────────────────────────────────
     st.subheader("Inventory Simulation")
     np.random.seed(42)
-    simulated_demand = np.random.poisson(inv['avg_daily_demand'],
-                                          size=forecast_days)
+    simulated_demand = np.random.poisson(inv['avg_daily_demand'], size=forecast_days)
     inventory_levels = []
     current_inventory = inv['eoq']
     orders = []
@@ -186,15 +273,18 @@ if st.sidebar.button("Run Forecast", type="primary"):
                 label=f"Safety Stock ({inv['safety_stock']:.1f} units)")
     for order in orders:
         ax2.axvline(x=order, color='green', alpha=0.3, linestyle=':')
-    ax2.set_title(f'Inventory Simulation - {product_id} at {selected_store_label}')
+    ax2.set_title(f'Inventory Simulation — {product_id} at {selected_store_label}')
     ax2.set_xlabel('Day')
     ax2.set_ylabel('Units in Stock')
     ax2.legend()
     plt.tight_layout()
     st.pyplot(fig2)
 
-    st.caption(f"Green dotted lines indicate order placement events. "
-               f"{len(orders)} orders placed over {forecast_days} day simulation.")
+    st.caption(
+        f"Green dotted lines indicate order placement events. "
+        f"{len(orders)} orders placed over {forecast_days} day simulation."
+    )
 
 else:
-    st.info("Select a product and store from the sidebar, then click Run Forecast to begin.")
+    st.info("Use the sidebar to select a category, department, product, and store — "
+            "then click **Run Forecast** to begin.")
