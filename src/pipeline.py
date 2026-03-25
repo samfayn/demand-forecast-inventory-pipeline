@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 from prophet import Prophet
+import duckdb                          # ── NEW: DuckDB import
+import os                              # ── NEW: for DB path handling
+from datetime import datetime          # ── NEW: for run timestamps
 
 # ── Label Mappings ────────────────────────────────────────────────────────
 STORE_LABELS = {
@@ -16,21 +19,18 @@ STORE_LABELS = {
     'WI_3': 'Wisconsin - Store 3'
 }
 
-# State grouping for cascading store selection
 STATE_LABELS = {
     'CA': 'California',
     'TX': 'Texas',
     'WI': 'Wisconsin'
 }
 
-# Maps state code → list of store IDs in that state
 STORES_BY_STATE = {
     'CA': ['CA_1', 'CA_2', 'CA_3', 'CA_4'],
     'TX': ['TX_1', 'TX_2', 'TX_3'],
     'WI': ['WI_1', 'WI_2', 'WI_3']
 }
 
-# Short store labels for use inside a state context (e.g. "Store 1")
 STORE_SHORT_LABELS = {
     'CA_1': 'Store 1', 'CA_2': 'Store 2', 'CA_3': 'Store 3', 'CA_4': 'Store 4',
     'TX_1': 'Store 1', 'TX_2': 'Store 2', 'TX_3': 'Store 3',
@@ -53,6 +53,13 @@ DEPT_LABELS = {
     'HOUSEHOLD_2': 'Household - Dept 2'
 }
 
+# ── DB Path ───────────────────────────────────────────────────────────────
+# Stored in the data/ folder alongside your parquet files.
+# Auto-created on first save; safe to delete to reset history.
+DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'inventory.duckdb')
+
+
+# ── Existing Functions (unchanged) ───────────────────────────────────────
 
 def load_data(parquet_path):
     """Load the cleaned sales data from parquet."""
@@ -78,9 +85,9 @@ def prepare_prophet_df(item_df):
 def train_forecast(df_prophet, forecast_days=90):
     """Train Prophet model and return forecast."""
     model = Prophet(
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
+        yearly_seasonality=True,  # type: ignore[arg-type]
+        weekly_seasonality=True,  # type: ignore[arg-type]
+        daily_seasonality=False,  # type: ignore[arg-type]
         changepoint_prior_scale=0.05
     )
     model.fit(df_prophet)
@@ -98,16 +105,15 @@ def evaluate_forecast(df_prophet, holdout_days=90):
     Returns None if there is not enough data to run a backtest.
     """
     if len(df_prophet) < holdout_days + 60:
-        # Need at least 60 days of training data beyond the holdout
         return None
 
     train_df = df_prophet.iloc[:-holdout_days].copy()
     actual_df = df_prophet.iloc[-holdout_days:].copy()
 
     model = Prophet(
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
+        yearly_seasonality=True,  # type: ignore[arg-type]
+        weekly_seasonality=True,  # type: ignore[arg-type]
+        daily_seasonality=False,  # type: ignore[arg-type]
         changepoint_prior_scale=0.05
     )
     model.fit(train_df)
@@ -115,7 +121,6 @@ def evaluate_forecast(df_prophet, holdout_days=90):
     future = model.make_future_dataframe(periods=holdout_days)
     forecast = model.predict(future)
 
-    # Align forecast to the holdout window
     holdout_forecast = forecast[forecast['ds'].isin(actual_df['ds'])][
         ['ds', 'yhat', 'yhat_lower', 'yhat_upper']
     ].copy()
@@ -123,7 +128,6 @@ def evaluate_forecast(df_prophet, holdout_days=90):
     comparison = actual_df.merge(holdout_forecast, on='ds', how='inner')
     comparison['yhat'] = comparison['yhat'].clip(lower=0)
 
-    # Filter to days with actual sales > 0 for MAPE (avoid division by zero)
     nonzero = comparison[comparison['y'] > 0].copy()
 
     if len(nonzero) == 0:
@@ -171,3 +175,196 @@ def calculate_inventory(forecast, df_prophet, avg_price,
         'eoq': eoq,
         'future_forecast': future_forecast
     }
+
+
+# ── NEW: DuckDB Functions ─────────────────────────────────────────────────
+
+def _init_db(con):
+    """
+    Create tables if they don't exist yet.
+    Called automatically on every save — safe to call repeatedly.
+
+    Schema:
+      forecast_runs  — one row per pipeline run (item + store + params)
+      forecast_daily — daily yhat values for each run (foreign key: run_id)
+    """
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_runs (
+            run_id          INTEGER PRIMARY KEY,
+            run_at          TIMESTAMP,
+            item_id         VARCHAR,
+            store_id        VARCHAR,
+            forecast_days   INTEGER,
+            lead_time_days  INTEGER,
+            ordering_cost   DOUBLE,
+            holding_cost    DOUBLE,
+            avg_daily_demand DOUBLE,
+            std_daily_demand DOUBLE,
+            safety_stock    DOUBLE,
+            rop             DOUBLE,
+            eoq             DOUBLE,
+            mape            DOUBLE,   -- NULL if backtest unavailable
+            rmse            DOUBLE    -- NULL if backtest unavailable
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_daily (
+            run_id      INTEGER,
+            ds          DATE,
+            yhat        DOUBLE,
+            yhat_lower  DOUBLE,
+            yhat_upper  DOUBLE
+        )
+    """)
+
+
+def save_results_to_db(item_id, store_id, inv, eval_results,
+                        forecast_days, lead_time, ordering_cost, holding_cost):
+    """
+    Persist a completed pipeline run to DuckDB.
+
+    Saves:
+      - All inventory policy metrics to forecast_runs
+      - Daily forecast values to forecast_daily
+
+    Called from app.py after run_pipeline() succeeds.
+    Returns the new run_id.
+    """
+    con = duckdb.connect(DB_PATH)
+    _init_db(con)
+
+    # Get the next run_id manually (DuckDB doesn't have SERIAL/AUTOINCREMENT)
+    result = con.execute("SELECT COALESCE(MAX(run_id), 0) + 1 FROM forecast_runs").fetchone()
+    run_id = result[0] if result is not None else 1
+
+    mape = eval_results['mape'] if eval_results else None
+    rmse = eval_results['rmse'] if eval_results else None
+
+    # ── Insert summary row into forecast_runs ─────────────────────────────
+    con.execute("""
+        INSERT INTO forecast_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        run_id,
+        datetime.now(),
+        item_id,
+        store_id,
+        forecast_days,
+        lead_time,
+        ordering_cost,
+        holding_cost,
+        inv['avg_daily_demand'],
+        inv['std_daily_demand'],
+        inv['safety_stock'],
+        inv['rop'],
+        inv['eoq'],
+        mape,
+        rmse
+    ])
+
+    # ── Insert daily forecast rows into forecast_daily ────────────────────
+    daily_df = inv['future_forecast'][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+    daily_df.insert(0, 'run_id', run_id)
+    con.execute("INSERT INTO forecast_daily SELECT * FROM daily_df")
+
+    con.close()
+    return run_id
+
+
+def load_all_runs(limit=200):
+    """
+    Query all saved forecast runs, most recent first.
+    Used by the Saved Results tab in app.py.
+
+    Returns a DataFrame with one row per run.
+    """
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+
+    con = duckdb.connect(DB_PATH, read_only=True)
+    df = con.execute(f"""
+        SELECT
+            run_id,
+            run_at,
+            item_id,
+            store_id,
+            forecast_days,
+            lead_time_days,
+            ordering_cost,
+            holding_cost,
+            ROUND(avg_daily_demand, 2)  AS avg_daily_demand,
+            ROUND(std_daily_demand, 2)  AS std_daily_demand,
+            ROUND(safety_stock, 1)      AS safety_stock,
+            ROUND(rop, 1)               AS rop,
+            ROUND(eoq, 1)               AS eoq,
+            ROUND(mape, 1)              AS mape,
+            ROUND(rmse, 2)              AS rmse
+        FROM forecast_runs
+        ORDER BY run_at DESC
+        LIMIT {limit}
+    """).df()
+    con.close()
+    return df
+
+
+def load_run_forecast(run_id):
+    """
+    Load daily forecast rows for a specific run_id.
+    Used to re-render the forecast chart from saved data (no Prophet needed).
+
+    Returns a DataFrame with columns: ds, yhat, yhat_lower, yhat_upper.
+    """
+    con = duckdb.connect(DB_PATH, read_only=True)
+    df = con.execute("""
+        SELECT ds, yhat, yhat_lower, yhat_upper
+        FROM forecast_daily
+        WHERE run_id = ?
+        ORDER BY ds
+    """, [run_id]).df()
+    con.close()
+    return df
+
+
+def query_runs(item_id=None, store_id=None, top_n_by_demand=None):
+    """
+    Flexible SQL query helper — filter saved runs by item, store,
+    or surface the top N items by average daily demand.
+
+    Examples:
+        query_runs(store_id='CA_1')
+        query_runs(item_id='FOODS_1_001_CA_1')
+        query_runs(store_id='TX_2', top_n_by_demand=10)
+    """
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+
+    con = duckdb.connect(DB_PATH, read_only=True)
+
+    filters = []
+    if item_id:
+        filters.append(f"item_id = '{item_id}'")
+    if store_id:
+        filters.append(f"store_id = '{store_id}'")
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    limit_clause = f"LIMIT {top_n_by_demand}" if top_n_by_demand else ""
+
+    df = con.execute(f"""
+        SELECT
+            run_id,
+            run_at,
+            item_id,
+            store_id,
+            ROUND(avg_daily_demand, 2) AS avg_daily_demand,
+            ROUND(safety_stock, 1)     AS safety_stock,
+            ROUND(rop, 1)              AS rop,
+            ROUND(eoq, 1)              AS eoq,
+            ROUND(mape, 1)             AS mape,
+            ROUND(rmse, 2)             AS rmse
+        FROM forecast_runs
+        {where_clause}
+        ORDER BY avg_daily_demand DESC
+        {limit_clause}
+    """).df()
+    con.close()
+    return df

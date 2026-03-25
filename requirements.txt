@@ -5,3 +5,4 @@ prophet
 streamlit
 pyarrow
 jupyter
+duckdb
