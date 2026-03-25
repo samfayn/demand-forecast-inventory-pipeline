@@ -8,18 +8,16 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from pipeline import (load_data, get_single_item, prepare_prophet_df,
                       train_forecast, evaluate_forecast, calculate_inventory,
-                      save_results_to_db, load_all_runs, load_run_forecast,  # ── NEW
+                      save_results_to_db, load_all_runs, load_run_forecast,
                       STORE_LABELS, STORES_BY_STATE, STATE_LABELS,
                       STORE_SHORT_LABELS, CATEGORY_LABELS, DEPT_LABELS)
 
-# ── Page Config ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="Demand Forecast & Inventory Optimizer",
                    layout="wide")
 
 st.title("Demand Forecast & Inventory Optimization Pipeline")
 st.markdown("Built with Prophet forecasting and ISE inventory principles.")
 
-# ── Load Data ─────────────────────────────────────────────────────────────
 @st.cache_data
 def load_cached_data():
     df = load_data('data/sales_clean.parquet')
@@ -28,10 +26,9 @@ def load_cached_data():
 
 sales_clean = load_cached_data()
 
-# ── Precompute avg demand per item for sorting dropdowns ──────────────────
 @st.cache_data
 def get_product_demand_summary(df):
-    """Avg daily demand per item across all stores — used for sorting only."""
+    """Avg daily demand per item across all stores, used to sort dropdowns."""
     summary = (
         df.groupby(['item_id', 'cat_id', 'dept_id'])['sales']
         .mean()
@@ -42,7 +39,6 @@ def get_product_demand_summary(df):
 
 demand_summary = get_product_demand_summary(sales_clean)
 
-# ── Cached Pipeline (shared by both tabs) ────────────────────────────────
 @st.cache_data
 def run_pipeline(product_id, store_id, forecast_days,
                  lead_time, ordering_cost, holding_cost):
@@ -59,16 +55,12 @@ def run_pipeline(product_id, store_id, forecast_days,
     eval_results = evaluate_forecast(df_prophet, holdout_days=90)
     return item_df, df_prophet, forecast, inv, eval_results
 
-# ── Tabs ──────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📈 Single Product", "🔍 Compare Products", "📂 Saved Results"])  # ── NEW tab3
+tab1, tab2, tab3 = st.tabs(["📈 Single Product", "🔍 Compare Products", "📂 Saved Results"])
 
 
-# ═════════════════════════════════════════════════════════════════════════
-# TAB 1 — SINGLE PRODUCT
-# ═════════════════════════════════════════════════════════════════════════
+# Tab 1 — Single Product
 with tab1:
 
-    # ── Sidebar: Product Selection ────────────────────────────────────────
     st.sidebar.header("① Product Selection")
 
     st.sidebar.subheader("Category")
@@ -99,7 +91,6 @@ with tab1:
         dept_products['label'] == selected_product_label]['item_id'].values[0]
     cat_id = selected_cat_id
 
-    # ── Sidebar: Store Selection ──────────────────────────────────────────
     st.sidebar.header("① Store Selection")
 
     st.sidebar.subheader("State")
@@ -118,11 +109,10 @@ with tab1:
     store_id = store_ids_in_state[store_short_options.index(selected_store_short)]
     selected_store_label = STORE_LABELS[store_id]
 
-    # ── Sidebar: Inventory Parameters (shared with Tab 2) ─────────────────
     st.sidebar.header("Inventory Parameters")
-    lead_time     = st.sidebar.slider("Lead Time (days)", 1, 30, 7)
+    lead_time = st.sidebar.slider("Lead Time (days)", 1, 30, 7)
     ordering_cost = st.sidebar.slider("Ordering Cost ($)", 1, 100, 10)
-    holding_cost  = st.sidebar.slider("Holding Cost (% of price/year)", 0.05, 0.50, 0.20)
+    holding_cost = st.sidebar.slider("Holding Cost (% of price/year)", 0.05, 0.50, 0.20)
     forecast_days = st.sidebar.slider("Forecast Horizon (days)", 30, 180, 90)
 
     if st.sidebar.button("Run Forecast", type="primary", key="run_t1"):
@@ -139,7 +129,6 @@ with tab1:
 
         assert item_df is not None and df_prophet is not None and forecast is not None
 
-        # ── NEW: Save results to DuckDB ───────────────────────────────────
         run_id = save_results_to_db(
             item_id=product_id,
             store_id=store_id,
@@ -151,29 +140,25 @@ with tab1:
             holding_cost=holding_cost
         )
         st.toast(f"✅ Run saved to database (run #{run_id})", icon="💾")
-        # ─────────────────────────────────────────────────────────────────
 
-        # ── Product Header ────────────────────────────────────────────────
         st.subheader(f"{CATEGORY_LABELS.get(cat_id, cat_id)} | "
                      f"{product_id} at {selected_store_label}")
 
-        # ── KPI Metrics ───────────────────────────────────────────────────
         st.subheader("Inventory Policy Results")
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Avg Daily Demand",  f"{inv['avg_daily_demand']:.2f} units")
-        col2.metric("Safety Stock",      f"{inv['safety_stock']:.1f} units")
-        col3.metric("Reorder Point",     f"{inv['rop']:.1f} units")
-        col4.metric("EOQ",               f"{inv['eoq']:.1f} units")
+        col1.metric("Avg Daily Demand", f"{inv['avg_daily_demand']:.2f} units")
+        col2.metric("Safety Stock", f"{inv['safety_stock']:.1f} units")
+        col3.metric("Reorder Point", f"{inv['rop']:.1f} units")
+        col4.metric("EOQ", f"{inv['eoq']:.1f} units")
 
-        # ── Model Accuracy ────────────────────────────────────────────────
         st.subheader("Model Accuracy (90-Day Holdout Backtest)")
 
         if eval_results is None:
             st.warning("Not enough historical data to run a backtest for this item.")
         else:
-            mape            = eval_results['mape']
-            rmse            = eval_results['rmse']
-            avg_demand      = inv['avg_daily_demand']
+            mape = eval_results['mape']
+            rmse = eval_results['rmse']
+            avg_demand = inv['avg_daily_demand']
             is_intermittent = avg_demand < 1.5
 
             if mape < 20:   mape_label = f"✅ {mape:.1f}%"
@@ -230,13 +215,12 @@ with tab1:
                 "This gives an honest estimate of how accurate future forecasts will be."
             )
 
-        # ── Forecast Insights ─────────────────────────────────────────────
         st.subheader("Forecast Insights")
-        future_f       = inv['future_forecast']
-        peak_day       = future_f.loc[future_f['yhat'].idxmax()]
-        low_day        = future_f.loc[future_f['yhat'].idxmin()]
+        future_f = inv['future_forecast']
+        peak_day = future_f.loc[future_f['yhat'].idxmax()]
+        low_day = future_f.loc[future_f['yhat'].idxmin()]
         total_forecast = future_f['yhat'].sum()
-        avg_upper      = future_f['yhat_upper'].mean()
+        avg_upper = future_f['yhat_upper'].mean()
 
         icol1, icol2, icol3, icol4 = st.columns(4)
         icol1.metric("Total Forecasted Demand", f"{total_forecast:.0f} units",
@@ -250,7 +234,6 @@ with tab1:
         icol4.metric("Avg Worst-Case Daily Demand", f"{avg_upper:.2f} units",
                      help="Upper bound — use this for conservative planning")
 
-        # ── Forecast Chart ────────────────────────────────────────────────
         st.subheader("Demand Forecast")
         fig1, ax1 = plt.subplots(figsize=(12, 4))
         recent_history = df_prophet.tail(180)
@@ -270,7 +253,6 @@ with tab1:
         plt.tight_layout()
         st.pyplot(fig1)
 
-        # ── Plain English Summary ─────────────────────────────────────────
         st.subheader("Summary")
         st.info(f"""
         **What this means for {product_id}:**
@@ -285,10 +267,9 @@ with tab1:
         - Order **{inv['eoq']:.0f} units** at a time to minimize total inventory costs.
         """)
 
-        # ── Inventory Simulation ──────────────────────────────────────────
         st.subheader("Inventory Simulation")
         np.random.seed(42)
-        simulated_demand  = np.random.poisson(inv['avg_daily_demand'], size=forecast_days)
+        simulated_demand = np.random.poisson(inv['avg_daily_demand'], size=forecast_days)
         inventory_levels, orders = [], []
         current_inventory = inv['eoq']
 
@@ -324,9 +305,7 @@ with tab1:
                 "then click **Run Forecast** to begin.")
 
 
-# ═════════════════════════════════════════════════════════════════════════
-# TAB 2 — COMPARE PRODUCTS
-# ═════════════════════════════════════════════════════════════════════════
+# Tab 2 — Compare Products
 with tab2:
 
     st.markdown("### Compare Two Products Side by Side")
@@ -388,11 +367,11 @@ with tab2:
             "State", sorted(STATE_LABELS.values()), key="cmp_state")
         cmp_state_id = {v: k for k, v in STATE_LABELS.items()}[cmp_state_label]
     with scol2:
-        cmp_store_ids    = STORES_BY_STATE[cmp_state_id]
+        cmp_store_ids = STORES_BY_STATE[cmp_state_id]
         cmp_short_labels = [STORE_SHORT_LABELS[s] for s in cmp_store_ids]
-        cmp_store_short  = st.selectbox("Store", cmp_short_labels, key="cmp_store")
-        cmp_store_id     = cmp_store_ids[cmp_short_labels.index(cmp_store_short)]
-        cmp_store_label  = STORE_LABELS[cmp_store_id]
+        cmp_store_short = st.selectbox("Store", cmp_short_labels, key="cmp_store")
+        cmp_store_id = cmp_store_ids[cmp_short_labels.index(cmp_store_short)]
+        cmp_store_label = STORE_LABELS[cmp_store_id]
 
     st.divider()
 
@@ -414,13 +393,11 @@ with tab2:
 
         assert prophet_a is not None and prophet_b is not None
 
-        # ── NEW: Save both comparison runs to DuckDB ──────────────────────
         run_id_a = save_results_to_db(product_a_id, cmp_store_id, inv_a, eval_a,
                                        forecast_days, lead_time, ordering_cost, holding_cost)
         run_id_b = save_results_to_db(product_b_id, cmp_store_id, inv_b, eval_b,
                                        forecast_days, lead_time, ordering_cost, holding_cost)
         st.toast(f"✅ Both runs saved (run #{run_id_a} & #{run_id_b})", icon="💾")
-        # ─────────────────────────────────────────────────────────────────
 
         st.subheader("📊 Head-to-Head Comparison")
 
@@ -473,9 +450,9 @@ with tab2:
 
         demand_ratio = inv_a['avg_daily_demand'] / max(inv_b['avg_daily_demand'], 0.01)
         higher_label = product_a_id if demand_ratio >= 1 else product_b_id
-        lower_label  = product_b_id if demand_ratio >= 1 else product_a_id
-        ratio_val    = max(demand_ratio, 1 / max(demand_ratio, 0.01))
-        higher_ss    = product_a_id if inv_a['safety_stock'] >= inv_b['safety_stock'] else product_b_id
+        lower_label = product_b_id if demand_ratio >= 1 else product_a_id
+        ratio_val = max(demand_ratio, 1 / max(demand_ratio, 0.01))
+        higher_ss = product_a_id if inv_a['safety_stock'] >= inv_b['safety_stock'] else product_b_id
 
         st.info(
             f"**Key takeaway:** {higher_label} has {ratio_val:.1f}× higher average daily demand "
@@ -492,7 +469,7 @@ with tab2:
             (ax_b, prophet_b, inv_b, product_b_id, 'tomato'),
         ]:
             future_f = inv_x['future_forecast']
-            recent   = prophet_df.tail(180)
+            recent = prophet_df.tail(180)
             ax.plot(recent['ds'], recent['y'],
                     color=color, alpha=0.4, label='Historical (last 180d)')
             ax.plot(future_f['ds'], future_f['yhat'],
@@ -520,9 +497,7 @@ with tab2:
         )
 
 
-# ═════════════════════════════════════════════════════════════════════════
-# TAB 3 — SAVED RESULTS  (NEW — powered by DuckDB)
-# ═════════════════════════════════════════════════════════════════════════
+# Tab 3 — Saved Results
 with tab3:
 
     st.markdown("### Saved Forecast & Inventory Runs")
@@ -532,7 +507,6 @@ with tab3:
         "Query, filter, and re-inspect past runs here — no re-running Prophet needed."
     )
 
-    # ── Load all saved runs from DuckDB ───────────────────────────────────
     all_runs = load_all_runs(limit=200)
 
     if all_runs.empty:
@@ -540,18 +514,16 @@ with tab3:
                 "or **🔍 Compare Products** to populate this tab.")
         st.stop()
 
-    # ── Summary KPIs ──────────────────────────────────────────────────────
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Total Runs Saved", len(all_runs))
-    k2.metric("Unique Products",  int(all_runs['item_id'].nunique()))
-    k3.metric("Unique Stores",    int(all_runs['store_id'].nunique()))
+    k2.metric("Unique Products", int(all_runs['item_id'].nunique()))
+    k3.metric("Unique Stores", int(all_runs['store_id'].nunique()))
     valid_mapes = all_runs['mape'].dropna()
     k4.metric("Avg MAPE (where available)",
               f"{valid_mapes.mean():.1f}%" if not valid_mapes.empty else "N/A")
 
     st.divider()
 
-    # ── Filters ───────────────────────────────────────────────────────────
     st.markdown("#### Filter Saved Runs")
     fcol1, fcol2, fcol3 = st.columns(3)
 
@@ -565,15 +537,14 @@ with tab3:
 
     with fcol3:
         sort_options = {
-            "Most recent first":       ("run_at", False),
-            "Highest avg demand":      ("avg_daily_demand", False),
-            "Lowest MAPE (best fit)":  ("mape", True),
-            "Highest EOQ":             ("eoq", False),
+            "Most recent first": ("run_at", False),
+            "Highest avg demand": ("avg_daily_demand", False),
+            "Lowest MAPE (best fit)": ("mape", True),
+            "Highest EOQ": ("eoq", False),
         }
         selected_sort_label = st.selectbox("Sort by", list(sort_options.keys()), key="db_sort")
         sort_col, sort_asc = sort_options[selected_sort_label]
 
-    # ── Apply filters in Python (could also be pushed to SQL via query_runs()) ──
     filtered: pd.DataFrame = all_runs.copy()
     if selected_store_filter != "All stores":
         filtered = filtered[filtered['store_id'] == selected_store_filter]  # type: ignore[assignment]
@@ -583,20 +554,19 @@ with tab3:
 
     st.markdown(f"**{len(filtered)} run(s) shown**")
 
-    # ── Results Table ─────────────────────────────────────────────────────
     display_cols = {
-        'run_id':           'Run #',
-        'run_at':           'Timestamp',
-        'item_id':          'Product',
-        'store_id':         'Store',
-        'forecast_days':    'Horizon (days)',
-        'lead_time_days':   'Lead Time',
+        'run_id': 'Run #',
+        'run_at': 'Timestamp',
+        'item_id': 'Product',
+        'store_id': 'Store',
+        'forecast_days': 'Horizon (days)',
+        'lead_time_days': 'Lead Time',
         'avg_daily_demand': 'Avg Demand/day',
-        'safety_stock':     'Safety Stock',
-        'rop':              'ROP',
-        'eoq':              'EOQ',
-        'mape':             'MAPE (%)',
-        'rmse':             'RMSE',
+        'safety_stock': 'Safety Stock',
+        'rop': 'ROP',
+        'eoq': 'EOQ',
+        'mape': 'MAPE (%)',
+        'rmse': 'RMSE',
     }
     st.dataframe(
         filtered[list(display_cols.keys())].rename(columns=display_cols),  # type: ignore[call-overload]
@@ -604,7 +574,6 @@ with tab3:
         hide_index=True
     )
 
-    # ── Re-render Forecast Chart for a Selected Run ───────────────────────
     st.divider()
     st.markdown("#### Re-view Forecast for a Saved Run")
     st.caption("Select a run ID to re-render its forecast chart instantly — "
@@ -645,9 +614,9 @@ with tab3:
 
                 rcol1, rcol2, rcol3, rcol4 = st.columns(4)
                 rcol1.metric("Avg Daily Demand", f"{run_meta['avg_daily_demand']:.2f} units")
-                rcol2.metric("Safety Stock",     f"{run_meta['safety_stock']:.1f} units")
-                rcol3.metric("Reorder Point",    f"{run_meta['rop']:.1f} units")
-                rcol4.metric("EOQ",              f"{run_meta['eoq']:.1f} units")
+                rcol2.metric("Safety Stock", f"{run_meta['safety_stock']:.1f} units")
+                rcol3.metric("Reorder Point", f"{run_meta['rop']:.1f} units")
+                rcol4.metric("EOQ", f"{run_meta['eoq']:.1f} units")
 
                 mape_val = run_meta['mape']
                 if pd.notna(mape_val):
