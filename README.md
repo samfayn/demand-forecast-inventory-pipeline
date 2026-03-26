@@ -13,14 +13,17 @@ inventory policies through an interactive dashboard.
 
 ## Features
 
-- **Data Pipeline** — Ingests and transforms 3 raw datasets totaling 58M+ rows into 
+- **Data Pipeline** — Ingests and transforms 3 raw datasets totaling 58M+ rows into
   a clean, analysis-ready format using Pandas
-- **Demand Forecasting** — Trains a Facebook Prophet model per product to generate 
+- **Demand Forecasting** — Trains a Facebook Prophet model per product to generate
   90-day demand forecasts with uncertainty intervals
-- **Inventory Optimization** — Calculates Safety Stock, Reorder Point, and EOQ from 
+- **Inventory Optimization** — Calculates Safety Stock, Reorder Point, and EOQ from
   forecast outputs using ISE inventory theory
-- **Interactive Dashboard** — Streamlit app that allows users to select any 
+- **Interactive Dashboard** — Streamlit app that allows users to select any
   product/store combination and adjust inventory parameters in real time
+- **Persistent Results** — Every forecast run is automatically saved to a local DuckDB
+  database; past runs can be queried, filtered, and re-visualized without re-running
+  the model
 
 ## Tech Stack
 
@@ -28,6 +31,7 @@ inventory policies through an interactive dashboard.
 - Facebook Prophet
 - Streamlit
 - Matplotlib
+- DuckDB (SQL persistence layer)
 - Parquet / PyArrow
 
 ## Project Structure
@@ -35,12 +39,14 @@ inventory policies through an interactive dashboard.
 demand-forecast-inventory-pipeline/
 │
 ├── data/                          # Raw and processed data (not tracked in git)
+│   ├── sales_clean.parquet        # Cleaned output from notebook 01
+│   └── inventory.duckdb           # DuckDB database of saved forecast runs
 ├── notebooks/
 │   ├── 01_exploration.ipynb       # Data ingestion, cleaning, and transformation
 │   ├── 02_forecasting.ipynb       # Prophet model training and evaluation
 │   └── 03_inventory_optimization.ipynb  # Inventory policy calculations
 ├── src/
-│   └── pipeline.py                # Core reusable pipeline functions
+│   └── pipeline.py                # Core pipeline functions and DB read/write logic
 ├── app.py                         # Streamlit dashboard
 └── requirements.txt               # Project dependencies
 ```
@@ -97,6 +103,19 @@ The inventory policy is calculated using classic ISE formulas:
 | EOQ | √(2 × annual demand × ordering cost / holding cost × price) |
 
 A 95% service level (Z = 1.645) is used by default, adjustable in the dashboard.
+
+## Database
+
+Forecast results are persisted in a local DuckDB file (`data/inventory.duckdb`) using
+two tables:
+
+| Table | Description |
+|---|---|
+| `forecast_runs` | One row per run — item, store, parameters, and computed inventory metrics |
+| `forecast_daily` | Day-level forecast values (yhat, lower/upper bounds) linked to each run |
+
+The **Saved Results** tab in the dashboard reads directly from this database, so you
+can revisit and compare any prior run without retraining the model.
 
 ## Dataset
 
