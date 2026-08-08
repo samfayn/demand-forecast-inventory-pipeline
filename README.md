@@ -1,126 +1,165 @@
-# Demand Forecasting & Inventory Optimization Pipeline
+# Demand Forecasting & Inventory Optimization
 
-An end-to-end data pipeline that combines demand forecasting with ISE inventory 
-optimization principles to generate actionable inventory policies from raw retail data.
+A data preparation pipeline and interactive forecasting app that turns raw M5 retail
+data into inventory policies, with forecast accuracy validated by holdout backtesting
+and every run persisted to a queryable SQL database.
 
 ## Overview
 
-This project was built to demonstrate how Industrial & Systems Engineering concepts 
-like Economic Order Quantity (EOQ), Safety Stock, and Reorder Point calculations can 
-be powered by modern data science tools. It uses the M5 Forecasting dataset — a 
-real-world Walmart retail dataset — to forecast product demand and generate optimal 
-inventory policies through an interactive dashboard.
+This project applies Industrial & Systems Engineering inventory theory — Economic Order
+Quantity, Safety Stock, and Reorder Point — on top of a demand forecasting model, using
+the M5 Forecasting dataset of Walmart retail sales.
 
-## Features
+It has two parts:
 
-- **Data Pipeline** — Ingests and transforms 3 raw datasets totaling 58M+ rows into
-  a clean, analysis-ready format using Pandas
-- **Demand Forecasting** — Trains a Facebook Prophet model per product to generate
-  90-day demand forecasts with uncertainty intervals
-- **Inventory Optimization** — Calculates Safety Stock, Reorder Point, and EOQ from
-  forecast outputs using ISE inventory theory
-- **Interactive Dashboard** — Streamlit app that allows users to select any
-  product/store combination and adjust inventory parameters in real time
-- **Persistent Results** — Every forecast run is automatically saved to a local DuckDB
-  database; past runs can be queried, filtered, and re-visualized without re-running
-  the model
+1. **A batch data preparation pipeline** that reshapes and joins three raw CSV sources
+   into a single analysis-ready Parquet dataset.
+2. **An interactive Streamlit app** that forecasts demand for a selected product/store
+   combination, derives an inventory policy from the forecast, validates accuracy
+   against held-out data, and saves every run to DuckDB for later comparison.
+
+## Data Preparation Pipeline
+
+`notebooks/01_data_preparation.ipynb` performs the batch transformation:
+
+| Step | Detail |
+|---|---|
+| Ingest | 3 raw CSVs — daily sales (30,490 × 1,913 wide), calendar (1,969 rows), sell prices (6.8M rows) |
+| Reshape | Melts sales from wide to long format → **58.3M rows** |
+| Join | Merges calendar on `d`; merges prices on the composite key `(store_id, item_id, wm_yr_wk)` |
+| Filter | Drops 12.3M rows with no price — periods before an item was stocked at that store, which are structurally absent rather than zero-demand |
+| Persist | Writes **46.0M rows** to `sales_clean.parquet` |
+
+Final dataset: 3,049 products across 10 stores, 2011-01-29 to 2016-04-24.
+
+The pre-launch filter matters for correctness. Those rows carry a sales value of 0, but
+the item did not exist at that store yet. Treating them as real zero-demand observations
+would bias every downstream forecast and inflate safety stock requirements.
+
+## Forecasting
+
+Prophet models are trained **on demand, one per product/store selection**, not
+pre-trained across the catalog. Training is memoized with `@st.cache_data`, so
+re-selecting a combination reuses the fitted model instead of refitting it.
+
+Model configuration: yearly and weekly seasonality enabled, daily seasonality disabled,
+`changepoint_prior_scale=0.05`, 90-day forecast horizon.
+
+### Accuracy Validation
+
+Every forecast is backtested before its inventory policy is trusted:
+
+- Train on all data except the final 90 days
+- Predict that held-out window and compare against actuals
+- Report **MAPE** and **RMSE**
+
+MAPE is computed only over days with nonzero actual sales, since percentage error is
+undefined at zero and intermittent retail demand contains many zero days. Negative
+predictions are clipped to zero before scoring — negative demand is not physically
+meaningful.
+
+## Inventory Model
+
+| Metric | Formula |
+|---|---|
+| Safety Stock | Z × σ(demand) × √(lead time) |
+| Reorder Point | (Avg daily demand × lead time) + Safety Stock |
+| EOQ | √(2 × annual demand × ordering cost / (holding cost × price)) |
+
+Default service level is 95% (Z = 1.645), adjustable in the dashboard along with lead
+time, ordering cost, and holding cost.
+
+## Persistence Layer
+
+Results are written to a local DuckDB database (`data/inventory.duckdb`) using a
+header-detail schema rather than a single wide table:
+
+| Table | Grain | Contents |
+|---|---|---|
+| `forecast_runs` | One row per run | Run timestamp, item, store, input parameters, computed inventory metrics, MAPE, RMSE |
+| `forecast_daily` | One row per forecast day | `yhat` and its lower/upper bounds, linked to a run via `run_id` |
+
+Splitting by grain keeps run-level metrics from being duplicated across every forecast
+day, and lets the app load a saved run's summary without reading its daily rows. The
+**Saved Results** tab queries these tables directly, so any prior run can be revisited
+or compared without retraining.
 
 ## Tech Stack
 
-- Python, Pandas, NumPy
-- Facebook Prophet
-- Streamlit
-- Matplotlib
-- DuckDB (SQL persistence layer)
-- Parquet / PyArrow
+Python, Pandas, NumPy, Facebook Prophet, Streamlit, Matplotlib, DuckDB, Parquet/PyArrow
 
 ## Project Structure
+
 ```
 demand-forecast-inventory-pipeline/
 │
-├── data/                          # Raw and processed data (not tracked in git)
-│   ├── sales_clean.parquet        # Cleaned output from notebook 01
-│   └── inventory.duckdb           # DuckDB database of saved forecast runs
+├── data/                                # Not tracked in git
+│   ├── sales_clean.parquet              # Output of notebook 01
+│   └── inventory.duckdb                 # Saved forecast runs
 ├── notebooks/
-│   ├── 01_exploration.ipynb       # Data ingestion, cleaning, and transformation
-│   ├── 02_forecasting.ipynb       # Prophet model training and evaluation
-│   └── 03_inventory_optimization.ipynb  # Inventory policy calculations
+│   ├── 01_data_preparation.ipynb        # Batch pipeline: ingest, reshape, join, filter, persist
+│   ├── 02_forecasting.ipynb             # Prophet exploration and tuning
+│   └── 03_inventory_optimization.ipynb  # Inventory formula development
 ├── src/
-│   └── pipeline.py                # Core pipeline functions and DB read/write logic
-├── app.py                         # Streamlit dashboard
-└── requirements.txt               # Project dependencies
+│   └── pipeline.py                      # Core functions: forecasting, evaluation, inventory math, DB I/O
+├── app.py                               # Streamlit dashboard
+└── requirements.txt
 ```
 
-## Setup & Installation
+Notebooks 02 and 03 are development artifacts documenting how the forecasting and
+inventory logic were built. The production path is notebook 01 → `sales_clean.parquet`
+→ `app.py` → DuckDB.
 
-**1. Clone the repository**
+## Setup
+
+**1. Clone**
 ```bash
 git clone https://github.com/samfayn/demand-forecast-inventory-pipeline.git
 cd demand-forecast-inventory-pipeline
 ```
 
-**2. Create and activate a virtual environment**
+**2. Virtual environment**
 ```bash
 python -m venv venv
 .\venv\Scripts\activate        # Windows
 source venv/bin/activate       # Mac/Linux
 ```
 
-**3. Install dependencies**
+**3. Dependencies**
 ```bash
 pip install -r requirements.txt
 ```
 
-**4. Download the data**
+**4. Data**
 
-Download the following files from the 
-[M5 Forecasting Kaggle competition](https://www.kaggle.com/competitions/m5-forecasting-accuracy/data) 
-and place them in the `data/` folder:
+Download from the [M5 Forecasting competition](https://www.kaggle.com/competitions/m5-forecasting-accuracy/data)
+into `data/`:
 - `sales_train_validation.csv`
 - `calendar.csv`
 - `sell_prices.csv`
 
-**5. Run the data pipeline**
-
-Run the notebooks in order:
-- `notebooks/01_exploration.ipynb` — processes raw data and saves `data/sales_clean.parquet`
-- `notebooks/02_forecasting.ipynb` — explores the forecasting model
-- `notebooks/03_inventory_optimization.ipynb` — explores inventory calculations
+**5. Run the preparation pipeline**
+```bash
+jupyter notebook notebooks/01_data_preparation.ipynb
+```
+Run all cells to produce `data/sales_clean.parquet`.
 
 **6. Launch the dashboard**
 ```bash
 streamlit run app.py
 ```
 
-## Inventory Model
+## Known Limitations
 
-The inventory policy is calculated using classic ISE formulas:
-
-| Metric | Formula |
-|---|---|
-| Safety Stock | Z × σ(demand) × √(lead time) |
-| Reorder Point | (Avg daily demand × lead time) + Safety Stock |
-| EOQ | √(2 × annual demand × ordering cost / holding cost × price) |
-
-A 95% service level (Z = 1.645) is used by default, adjustable in the dashboard.
-
-## Database
-
-Forecast results are persisted in a local DuckDB file (`data/inventory.duckdb`) using
-two tables:
-
-| Table | Description |
-|---|---|
-| `forecast_runs` | One row per run — item, store, parameters, and computed inventory metrics |
-| `forecast_daily` | Day-level forecast values (yhat, lower/upper bounds) linked to each run |
-
-The **Saved Results** tab in the dashboard reads directly from this database, so you
-can revisit and compare any prior run without retraining the model.
+- The preparation stage runs as a notebook rather than under an orchestrator. Productionizing
+  would mean splitting it into discrete tasks with retry and failure handling.
+- Prophet treats each product/store series independently; no cross-series or hierarchical
+  effects are modeled.
+- Inventory calculations assume constant lead time and normally distributed demand, which
+  holds poorly for intermittent low-volume items.
+- `run_id` is assigned via `MAX(run_id) + 1`, which is not safe under concurrent writes.
 
 ## Dataset
 
-This project uses the 
-[M5 Forecasting dataset](https://www.kaggle.com/competitions/m5-forecasting-accuracy) 
-from Kaggle, which contains 5 years of daily sales data across 3,049 products in 
-10 Walmart stores across California, Texas, and Wisconsin.
-```
+[M5 Forecasting](https://www.kaggle.com/competitions/m5-forecasting-accuracy) — 5 years of
+daily sales across 3,049 products in 10 Walmart stores in California, Texas, and Wisconsin.
