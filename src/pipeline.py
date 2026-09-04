@@ -283,12 +283,19 @@ def query_runs(item_id=None, store_id=None, top_n_by_demand=None):
     con = duckdb.connect(DB_PATH, read_only=True)
 
     filters = []
+    params = []
     if item_id:
-        filters.append(f"item_id = '{item_id}'")
+        filters.append("item_id = ?")
+        params.append(item_id)
     if store_id:
-        filters.append(f"store_id = '{store_id}'")
+        filters.append("store_id = ?")
+        params.append(store_id)
     where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
-    limit_clause = f"LIMIT {top_n_by_demand}" if top_n_by_demand else ""
+
+    limit_clause = ""
+    if top_n_by_demand is not None:
+        limit_clause = "LIMIT ?"
+        params.append(int(top_n_by_demand))
 
     df = con.execute(f"""
         SELECT
@@ -303,6 +310,6 @@ def query_runs(item_id=None, store_id=None, top_n_by_demand=None):
         {where_clause}
         ORDER BY avg_daily_demand DESC
         {limit_clause}
-    """).df()
+    """, params).df()
     con.close()
     return df
