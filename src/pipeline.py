@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from scipy.stats import norm
 from prophet import Prophet
 import duckdb
 import os
@@ -134,7 +135,7 @@ def evaluate_forecast(df_prophet, holdout_days=90):
 def calculate_inventory(forecast, df_prophet, avg_price,
                          lead_time_days=7, service_level=0.95,
                          holding_cost=0.20, ordering_cost=10.0):
-    z_score = 1.645  # 95% service level
+    z_score = norm.ppf(service_level)
 
     future_forecast = forecast[
         forecast['ds'] > df_prophet['ds'].max()
@@ -174,6 +175,7 @@ def _init_db(con):
             lead_time_days   INTEGER,
             ordering_cost    DOUBLE,
             holding_cost     DOUBLE,
+            service_level    DOUBLE,
             avg_daily_demand DOUBLE,
             std_daily_demand DOUBLE,
             safety_stock     DOUBLE,
@@ -196,7 +198,8 @@ def _init_db(con):
 
 
 def save_results_to_db(item_id, store_id, inv, eval_results,
-                        forecast_days, lead_time, ordering_cost, holding_cost):
+                        forecast_days, lead_time, ordering_cost, holding_cost,
+                        service_level=0.95):
     con = duckdb.connect(DB_PATH)
     _init_db(con)
 
@@ -208,10 +211,10 @@ def save_results_to_db(item_id, store_id, inv, eval_results,
     rmse = eval_results['rmse'] if eval_results else None
 
     con.execute("""
-        INSERT INTO forecast_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO forecast_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         run_id, datetime.now(), item_id, store_id,
-        forecast_days, lead_time, ordering_cost, holding_cost,
+        forecast_days, lead_time, ordering_cost, holding_cost, service_level,
         inv['avg_daily_demand'], inv['std_daily_demand'],
         inv['safety_stock'], inv['rop'], inv['eoq'],
         mape, rmse
@@ -233,7 +236,7 @@ def load_all_runs(limit=200):
     df = con.execute(f"""
         SELECT
             run_id, run_at, item_id, store_id,
-            forecast_days, lead_time_days, ordering_cost, holding_cost,
+            forecast_days, lead_time_days, ordering_cost, holding_cost, service_level,
             ROUND(avg_daily_demand, 2) AS avg_daily_demand,
             ROUND(std_daily_demand, 2) AS std_daily_demand,
             ROUND(safety_stock, 1)     AS safety_stock,
