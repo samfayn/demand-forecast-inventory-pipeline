@@ -6,6 +6,14 @@ import duckdb
 import os
 from datetime import datetime
 
+
+class ForecastingError(Exception):
+    """Raised when Prophet model fitting or prediction fails."""
+
+
+class DatabaseError(Exception):
+    """Raised when a DuckDB read or write operation fails."""
+
 STORE_LABELS = {
     'CA_1': 'California - Store 1',
     'CA_2': 'California - Store 2',
@@ -75,16 +83,22 @@ def prepare_prophet_df(item_df):
 
 
 def train_forecast(df_prophet, forecast_days=90):
-    model = Prophet(
-        yearly_seasonality=True,  # type: ignore[arg-type]
-        weekly_seasonality=True,  # type: ignore[arg-type]
-        daily_seasonality=False,  # type: ignore[arg-type]
-        changepoint_prior_scale=0.05
-    )
-    model.fit(df_prophet)
-    future = model.make_future_dataframe(periods=forecast_days)
-    forecast = model.predict(future)
-    return forecast
+    try:
+        model = Prophet(
+            yearly_seasonality=True,  # type: ignore[arg-type]
+            weekly_seasonality=True,  # type: ignore[arg-type]
+            daily_seasonality=False,  # type: ignore[arg-type]
+            changepoint_prior_scale=0.05
+        )
+        model.fit(df_prophet)
+        future = model.make_future_dataframe(periods=forecast_days)
+        forecast = model.predict(future)
+        return forecast
+    except Exception as e:
+        raise ForecastingError(
+            f"Prophet failed to fit or predict for this product/store "
+            f"combination ({len(df_prophet)} data points): {e}"
+        ) from e
 
 
 def evaluate_forecast(df_prophet, holdout_days=90):
@@ -98,16 +112,22 @@ def evaluate_forecast(df_prophet, holdout_days=90):
     train_df = df_prophet.iloc[:-holdout_days].copy()
     actual_df = df_prophet.iloc[-holdout_days:].copy()
 
-    model = Prophet(
-        yearly_seasonality=True,  # type: ignore[arg-type]
-        weekly_seasonality=True,  # type: ignore[arg-type]
-        daily_seasonality=False,  # type: ignore[arg-type]
-        changepoint_prior_scale=0.05
-    )
-    model.fit(train_df)
+    try:
+        model = Prophet(
+            yearly_seasonality=True,  # type: ignore[arg-type]
+            weekly_seasonality=True,  # type: ignore[arg-type]
+            daily_seasonality=False,  # type: ignore[arg-type]
+            changepoint_prior_scale=0.05
+        )
+        model.fit(train_df)
 
-    future = model.make_future_dataframe(periods=holdout_days)
-    forecast = model.predict(future)
+        future = model.make_future_dataframe(periods=holdout_days)
+        forecast = model.predict(future)
+    except Exception as e:
+        raise ForecastingError(
+            f"Prophet failed during backtest fit/predict "
+            f"({len(train_df)} training points): {e}"
+        ) from e
 
     holdout_forecast = forecast[forecast['ds'].isin(actual_df['ds'])][
         ['ds', 'yhat', 'yhat_lower', 'yhat_upper']
@@ -200,72 +220,78 @@ def _init_db(con):
 def save_results_to_db(item_id, store_id, inv, eval_results,
                         forecast_days, lead_time, ordering_cost, holding_cost,
                         service_level=0.95):
-    con = duckdb.connect(DB_PATH)
-    _init_db(con)
+    try:
+        with duckdb.connect(DB_PATH) as con:
+            _init_db(con)
 
-    # DuckDB doesn't support SERIAL/AUTOINCREMENT
-    result = con.execute("SELECT COALESCE(MAX(run_id), 0) + 1 FROM forecast_runs").fetchone()
-    run_id = result[0] if result is not None else 1
+            # DuckDB doesn't support SERIAL/AUTOINCREMENT
+            result = con.execute("SELECT COALESCE(MAX(run_id), 0) + 1 FROM forecast_runs").fetchone()
+            run_id = result[0] if result is not None else 1
 
-    mape = eval_results['mape'] if eval_results else None
-    rmse = eval_results['rmse'] if eval_results else None
+            mape = eval_results['mape'] if eval_results else None
+            rmse = eval_results['rmse'] if eval_results else None
 
-    con.execute("""
-        INSERT INTO forecast_runs (
-            run_id, run_at, item_id, store_id,
-            forecast_days, lead_time_days, ordering_cost, holding_cost, service_level,
-            avg_daily_demand, std_daily_demand, safety_stock, rop, eoq, mape, rmse
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        run_id, datetime.now(), item_id, store_id,
-        forecast_days, lead_time, ordering_cost, holding_cost, service_level,
-        inv['avg_daily_demand'], inv['std_daily_demand'],
-        inv['safety_stock'], inv['rop'], inv['eoq'],
-        mape, rmse
-    ])
+            con.execute("""
+                INSERT INTO forecast_runs (
+                    run_id, run_at, item_id, store_id,
+                    forecast_days, lead_time_days, ordering_cost, holding_cost, service_level,
+                    avg_daily_demand, std_daily_demand, safety_stock, rop, eoq, mape, rmse
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                run_id, datetime.now(), item_id, store_id,
+                forecast_days, lead_time, ordering_cost, holding_cost, service_level,
+                inv['avg_daily_demand'], inv['std_daily_demand'],
+                inv['safety_stock'], inv['rop'], inv['eoq'],
+                mape, rmse
+            ])
 
-    daily_df = inv['future_forecast'][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
-    daily_df.insert(0, 'run_id', run_id)
-    con.execute("INSERT INTO forecast_daily SELECT * FROM daily_df")
+            daily_df = inv['future_forecast'][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+            daily_df.insert(0, 'run_id', run_id)
+            con.execute("INSERT INTO forecast_daily SELECT * FROM daily_df")
 
-    con.close()
-    return run_id
+        return run_id
+    except duckdb.Error as e:
+        raise DatabaseError(f"Failed to save forecast run to database: {e}") from e
 
 
 def load_all_runs(limit=200):
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
 
-    con = duckdb.connect(DB_PATH, read_only=True)
-    df = con.execute(f"""
-        SELECT
-            run_id, run_at, item_id, store_id,
-            forecast_days, lead_time_days, ordering_cost, holding_cost, service_level,
-            ROUND(avg_daily_demand, 2) AS avg_daily_demand,
-            ROUND(std_daily_demand, 2) AS std_daily_demand,
-            ROUND(safety_stock, 1)     AS safety_stock,
-            ROUND(rop, 1)              AS rop,
-            ROUND(eoq, 1)              AS eoq,
-            ROUND(mape, 1)             AS mape,
-            ROUND(rmse, 2)             AS rmse
-        FROM forecast_runs
-        ORDER BY run_at DESC
-        LIMIT {limit}
-    """).df()
-    con.close()
-    return df
+    try:
+        with duckdb.connect(DB_PATH, read_only=True) as con:
+            df = con.execute(f"""
+                SELECT
+                    run_id, run_at, item_id, store_id,
+                    forecast_days, lead_time_days, ordering_cost, holding_cost, service_level,
+                    ROUND(avg_daily_demand, 2) AS avg_daily_demand,
+                    ROUND(std_daily_demand, 2) AS std_daily_demand,
+                    ROUND(safety_stock, 1)     AS safety_stock,
+                    ROUND(rop, 1)              AS rop,
+                    ROUND(eoq, 1)              AS eoq,
+                    ROUND(mape, 1)             AS mape,
+                    ROUND(rmse, 2)             AS rmse
+                FROM forecast_runs
+                ORDER BY run_at DESC
+                LIMIT {limit}
+            """).df()
+        return df
+    except duckdb.Error as e:
+        raise DatabaseError(f"Failed to load saved runs: {e}") from e
 
 
 def load_run_forecast(run_id):
-    con = duckdb.connect(DB_PATH, read_only=True)
-    df = con.execute("""
-        SELECT ds, yhat, yhat_lower, yhat_upper
-        FROM forecast_daily
-        WHERE run_id = ?
-        ORDER BY ds
-    """, [run_id]).df()
-    con.close()
-    return df
+    try:
+        with duckdb.connect(DB_PATH, read_only=True) as con:
+            df = con.execute("""
+                SELECT ds, yhat, yhat_lower, yhat_upper
+                FROM forecast_daily
+                WHERE run_id = ?
+                ORDER BY ds
+            """, [run_id]).df()
+        return df
+    except duckdb.Error as e:
+        raise DatabaseError(f"Failed to load forecast for run #{run_id}: {e}") from e
 
 
 def query_runs(item_id=None, store_id=None, top_n_by_demand=None):
@@ -280,36 +306,37 @@ def query_runs(item_id=None, store_id=None, top_n_by_demand=None):
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
 
-    con = duckdb.connect(DB_PATH, read_only=True)
+    try:
+        with duckdb.connect(DB_PATH, read_only=True) as con:
+            filters = []
+            params = []
+            if item_id:
+                filters.append("item_id = ?")
+                params.append(item_id)
+            if store_id:
+                filters.append("store_id = ?")
+                params.append(store_id)
+            where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
 
-    filters = []
-    params = []
-    if item_id:
-        filters.append("item_id = ?")
-        params.append(item_id)
-    if store_id:
-        filters.append("store_id = ?")
-        params.append(store_id)
-    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+            limit_clause = ""
+            if top_n_by_demand is not None:
+                limit_clause = "LIMIT ?"
+                params.append(int(top_n_by_demand))
 
-    limit_clause = ""
-    if top_n_by_demand is not None:
-        limit_clause = "LIMIT ?"
-        params.append(int(top_n_by_demand))
-
-    df = con.execute(f"""
-        SELECT
-            run_id, run_at, item_id, store_id,
-            ROUND(avg_daily_demand, 2) AS avg_daily_demand,
-            ROUND(safety_stock, 1)     AS safety_stock,
-            ROUND(rop, 1)              AS rop,
-            ROUND(eoq, 1)              AS eoq,
-            ROUND(mape, 1)             AS mape,
-            ROUND(rmse, 2)             AS rmse
-        FROM forecast_runs
-        {where_clause}
-        ORDER BY avg_daily_demand DESC
-        {limit_clause}
-    """, params).df()
-    con.close()
-    return df
+            df = con.execute(f"""
+                SELECT
+                    run_id, run_at, item_id, store_id,
+                    ROUND(avg_daily_demand, 2) AS avg_daily_demand,
+                    ROUND(safety_stock, 1)     AS safety_stock,
+                    ROUND(rop, 1)              AS rop,
+                    ROUND(eoq, 1)              AS eoq,
+                    ROUND(mape, 1)             AS mape,
+                    ROUND(rmse, 2)             AS rmse
+                FROM forecast_runs
+                {where_clause}
+                ORDER BY avg_daily_demand DESC
+                {limit_clause}
+            """, params).df()
+        return df
+    except duckdb.Error as e:
+        raise DatabaseError(f"Failed to query saved runs: {e}") from e
