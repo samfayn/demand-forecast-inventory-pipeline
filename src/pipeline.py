@@ -211,7 +211,11 @@ def save_results_to_db(item_id, store_id, inv, eval_results,
     rmse = eval_results['rmse'] if eval_results else None
 
     con.execute("""
-        INSERT INTO forecast_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO forecast_runs (
+            run_id, run_at, item_id, store_id,
+            forecast_days, lead_time_days, ordering_cost, holding_cost, service_level,
+            avg_daily_demand, std_daily_demand, safety_stock, rop, eoq, mape, rmse
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         run_id, datetime.now(), item_id, store_id,
         forecast_days, lead_time, ordering_cost, holding_cost, service_level,
