@@ -9,6 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from pipeline import (load_data, get_single_item, prepare_prophet_df,
                       train_forecast, evaluate_forecast, calculate_inventory,
                       save_results_to_db, load_all_runs, load_run_forecast,
+                      ForecastingError, DatabaseError,
                       STORE_LABELS, STORES_BY_STATE, STATE_LABELS,
                       STORE_SHORT_LABELS, CATEGORY_LABELS, DEPT_LABELS)
  
@@ -120,31 +121,39 @@ with tab1:
     forecast_days = st.sidebar.slider("Forecast Horizon (days)", 30, 180, 90)
  
     if st.sidebar.button("Run Forecast", type="primary", key="run_t1"):
- 
-        with st.spinner("Training forecast model... this may take a moment"):
-            item_df, df_prophet, forecast, inv, eval_results = run_pipeline(
-                product_id, store_id, forecast_days,
-                lead_time, ordering_cost, holding_cost, service_level)
- 
+
+        try:
+            with st.spinner("Training forecast model... this may take a moment"):
+                item_df, df_prophet, forecast, inv, eval_results = run_pipeline(
+                    product_id, store_id, forecast_days,
+                    lead_time, ordering_cost, holding_cost, service_level)
+        except ForecastingError as e:
+            st.error(f"Forecasting failed for this product/store combination: {e}")
+            st.stop()
+
         if inv is None:
             st.error("Not enough data for this product/store combination. "
                      "Please select another.")
             st.stop()
- 
+
         assert item_df is not None and df_prophet is not None and forecast is not None
- 
-        run_id = save_results_to_db(
-            item_id=product_id,
-            store_id=store_id,
-            inv=inv,
-            eval_results=eval_results,
-            forecast_days=forecast_days,
-            lead_time=lead_time,
-            ordering_cost=ordering_cost,
-            holding_cost=holding_cost,
-            service_level=service_level
-        )
-        st.toast(f"✅ Run saved to database (run #{run_id})", icon="💾")
+
+        try:
+            run_id = save_results_to_db(
+                item_id=product_id,
+                store_id=store_id,
+                inv=inv,
+                eval_results=eval_results,
+                forecast_days=forecast_days,
+                lead_time=lead_time,
+                ordering_cost=ordering_cost,
+                holding_cost=holding_cost,
+                service_level=service_level
+            )
+            st.toast(f"✅ Run saved to database (run #{run_id})", icon="💾")
+        except DatabaseError as e:
+            st.warning(f"Forecast computed successfully, but saving this run "
+                       f"to the database failed: {e}")
  
         st.subheader(f"{CATEGORY_LABELS.get(cat_id, cat_id)} | "
                      f"{product_id} at {selected_store_label}")
@@ -381,30 +390,38 @@ with tab2:
     st.divider()
  
     if st.button("Run Comparison", type="primary", key="run_cmp"):
- 
-        with st.spinner("Training two forecast models... this may take a moment"):
-            res_a = run_pipeline(product_a_id, cmp_store_id, forecast_days,
-                                 lead_time, ordering_cost, holding_cost, service_level)
-            res_b = run_pipeline(product_b_id, cmp_store_id, forecast_days,
-                                 lead_time, ordering_cost, holding_cost, service_level)
- 
+
+        try:
+            with st.spinner("Training two forecast models... this may take a moment"):
+                res_a = run_pipeline(product_a_id, cmp_store_id, forecast_days,
+                                     lead_time, ordering_cost, holding_cost, service_level)
+                res_b = run_pipeline(product_b_id, cmp_store_id, forecast_days,
+                                     lead_time, ordering_cost, holding_cost, service_level)
+        except ForecastingError as e:
+            st.error(f"Forecasting failed for one of these product/store combinations: {e}")
+            st.stop()
+
         item_a, prophet_a, fc_a, inv_a, eval_a = res_a
         item_b, prophet_b, fc_b, inv_b, eval_b = res_b
- 
+
         if inv_a is None or inv_b is None:
             st.error("One or both products don't have enough data for this store. "
                      "Try a different combination.")
             st.stop()
- 
+
         assert prophet_a is not None and prophet_b is not None
- 
-        run_id_a = save_results_to_db(product_a_id, cmp_store_id, inv_a, eval_a,
-                                       forecast_days, lead_time, ordering_cost, holding_cost,
-                                       service_level=service_level)
-        run_id_b = save_results_to_db(product_b_id, cmp_store_id, inv_b, eval_b,
-                                       forecast_days, lead_time, ordering_cost, holding_cost,
-                                       service_level=service_level)
-        st.toast(f"✅ Both runs saved (run #{run_id_a} & #{run_id_b})", icon="💾")
+
+        try:
+            run_id_a = save_results_to_db(product_a_id, cmp_store_id, inv_a, eval_a,
+                                           forecast_days, lead_time, ordering_cost, holding_cost,
+                                           service_level=service_level)
+            run_id_b = save_results_to_db(product_b_id, cmp_store_id, inv_b, eval_b,
+                                           forecast_days, lead_time, ordering_cost, holding_cost,
+                                           service_level=service_level)
+            st.toast(f"✅ Both runs saved (run #{run_id_a} & #{run_id_b})", icon="💾")
+        except DatabaseError as e:
+            st.warning(f"Comparison computed successfully, but saving these runs "
+                       f"to the database failed: {e}")
  
         st.subheader("📊 Head-to-Head Comparison")
  
@@ -629,4 +646,3 @@ with tab3:
                 if pd.notna(mape_val):
                     st.caption(f"Model accuracy on this run — MAPE: {mape_val:.1f}%  |  "
                                f"RMSE: {run_meta['rmse']:.2f} units")
- 
