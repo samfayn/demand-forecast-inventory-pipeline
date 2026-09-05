@@ -28,6 +28,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from pipeline import ANALYSIS_COLUMNS, load_data  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -91,6 +93,17 @@ def build(full_parquet, full_db, max_pairs=None, all_stores=False):
             "from the same pipeline run?")
 
     os.makedirs(DEMO_DIR, exist_ok=True)
+
+    # Keep only the columns anything downstream reads. The pipeline's own
+    # output also carries `id`, `d` and `wm_yr_wk`, which nothing uses and
+    # which together account for a large share of in-memory size once pandas
+    # expands the repeated strings.
+    keep = [c for c in ANALYSIS_COLUMNS if c in demo.columns]
+    dropped = [c for c in demo.columns if c not in keep]
+    if dropped:
+        logger.info("Dropping unused columns: %s", ', '.join(dropped))
+    demo = demo[keep]
+
     demo.to_parquet(DEMO_PARQUET, index=False)
     shutil.copy2(full_db, DEMO_DB)
 
@@ -100,8 +113,19 @@ def build(full_parquet, full_db, max_pairs=None, all_stores=False):
     logger.info("Demo dataset: %s rows (%.1f%% of full), %s items, %s stores",
                 f"{len(demo):,}", 100 * len(demo) / len(df),
                 demo['item_id'].nunique(), demo['store_id'].nunique())
-    logger.info("Wrote %s (%.1f MB)", DEMO_PARQUET, parquet_mb)
+    logger.info("Wrote %s (%.1f MB on disk)", DEMO_PARQUET, parquet_mb)
     logger.info("Wrote %s (%.1f MB)", DEMO_DB, db_mb)
+
+    # On-disk size is not the constraint. Parquet compresses repeated strings
+    # hard, so a small file can still blow past a hosting memory cap once
+    # pandas expands it. Report what the app will actually hold.
+    loaded = load_data(DEMO_PARQUET)
+    in_memory_mb = loaded.memory_usage(deep=True).sum() / 1e6
+    logger.info("In memory once loaded: %.0f MB", in_memory_mb)
+    if in_memory_mb > 700:
+        logger.warning(
+            "%.0f MB in memory is close to Streamlit Community Cloud's ~1 GB "
+            "limit. Re-run with a smaller --max-pairs.", in_memory_mb)
 
     total_mb = parquet_mb + db_mb
     if total_mb > 90:

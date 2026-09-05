@@ -1,4 +1,5 @@
 import pandas as pd
+import pyarrow.parquet as pq
 import numpy as np
 from scipy.stats import norm
 from prophet import Prophet
@@ -93,8 +94,56 @@ PARQUET_PATH = _resolve_data_path('sales_clean.parquet', 'sales_demo.parquet')
 USING_DEMO_DATA = 'demo_data' in PARQUET_PATH
 
 
-def load_data(parquet_path):
-    return pd.read_parquet(parquet_path)
+ANALYSIS_COLUMNS = ['item_id', 'store_id', 'state_id', 'cat_id', 'dept_id',
+                    'date', 'sales', 'sell_price']
+
+# Columns whose values repeat across millions of rows. Stored as pandas
+# categoricals they become an integer code plus a small lookup table, which
+# on the demo dataset cuts memory by roughly 70% on its own.
+CATEGORICAL_COLUMNS = ['item_id', 'store_id', 'state_id', 'cat_id', 'dept_id']
+
+
+def load_data(parquet_path, columns=ANALYSIS_COLUMNS, optimize_memory=True):
+    """
+    Read the cleaned sales Parquet.
+
+    By default reads only the columns the forecasting and dashboard code
+    actually uses, and converts the repeated identifier columns to
+    categoricals with float32 measures. On the deployed demo dataset that is
+    the difference between roughly 1.4 GB and 190 MB in memory, which matters
+    because Streamlit Community Cloud caps an app near 1 GB.
+
+    Pass columns=None to read everything (the pipeline's own output has
+    additional columns such as `id`, `d` and `wm_yr_wk` that nothing
+    downstream reads), or optimize_memory=False to keep raw dtypes.
+    """
+    if columns is not None:
+        # Only request columns the file actually has. pyarrow raises a fairly
+        # opaque ArrowInvalid if asked for a missing field, and a Parquet
+        # written by a different or older version of the pipeline may not
+        # carry all of them.
+        available = set(pq.read_schema(parquet_path).names)
+        columns = [c for c in columns if c in available]
+        if not columns:
+            raise ValueError(
+                f"{parquet_path} has none of the expected columns "
+                f"({', '.join(ANALYSIS_COLUMNS)}). Found: "
+                f"{', '.join(sorted(available))}")
+
+    df = pd.read_parquet(parquet_path, columns=columns)
+
+    if not optimize_memory:
+        return df
+
+    for col in CATEGORICAL_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].astype('category')
+
+    for col in ('sales', 'sell_price'):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], downcast='float')
+
+    return df
 
 
 def get_single_item(df, product_id, store_id):

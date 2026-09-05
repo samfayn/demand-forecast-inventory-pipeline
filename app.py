@@ -41,9 +41,10 @@ if USING_DEMO_DATA:
  
 @st.cache_data
 def load_cached_data():
-    df = load_data(PARQUET_PATH)
-    return df[['item_id', 'store_id', 'state_id',
-                'cat_id', 'dept_id', 'date', 'sales', 'sell_price']]
+    # load_data reads only the columns used downstream and applies categorical
+    # dtypes, so the subsetting that used to happen here is done before the
+    # data is ever materialized rather than after.
+    return load_data(PARQUET_PATH)
  
 sales_clean = load_cached_data()
  
