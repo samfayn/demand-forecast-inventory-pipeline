@@ -61,7 +61,36 @@ DEPT_LABELS = {
     'HOUSEHOLD_2': 'Household - Dept 2'
 }
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'inventory.duckdb')
+_REPO_ROOT = os.path.join(os.path.dirname(__file__), '..')
+
+
+def _resolve_data_path(full_name, demo_name):
+    """
+    Prefer the full local dataset, fall back to the committed demo subset.
+
+    data/ holds the real 46M-row output of data_prep.py and is gitignored, so
+    it exists on a developer machine but never in a fresh clone or on
+    Streamlit Community Cloud. demo_data/ holds a small committed subset
+    covering the item/store pairs that have saved forecast runs, which is what
+    the deployed app runs on. Returning the full path when neither exists
+    keeps the resulting error message pointing at the thing the user is
+    expected to build.
+    """
+    full = os.path.join(_REPO_ROOT, 'data', full_name)
+    demo = os.path.join(_REPO_ROOT, 'demo_data', demo_name)
+    if os.path.exists(full):
+        return full
+    if os.path.exists(demo):
+        return demo
+    return full
+
+
+DB_PATH = _resolve_data_path('inventory.duckdb', 'inventory_demo.duckdb')
+PARQUET_PATH = _resolve_data_path('sales_clean.parquet', 'sales_demo.parquet')
+
+# True when running against the trimmed demo subset rather than the full
+# dataset, so the UI can say so instead of implying it has everything.
+USING_DEMO_DATA = 'demo_data' in PARQUET_PATH
 
 
 def load_data(parquet_path):

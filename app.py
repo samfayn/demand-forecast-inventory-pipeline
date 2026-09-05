@@ -10,6 +10,7 @@ from pipeline import (load_data, get_single_item, prepare_prophet_df,
                       train_forecast, evaluate_forecast, calculate_inventory,
                       save_results_to_db, load_all_runs, load_run_forecast,
                       ForecastingError, DatabaseError,
+                      PARQUET_PATH, USING_DEMO_DATA,
                       STORE_LABELS, STORES_BY_STATE, STATE_LABELS,
                       STORE_SHORT_LABELS, CATEGORY_LABELS, DEPT_LABELS)
  
@@ -18,10 +19,28 @@ st.set_page_config(page_title="Demand Forecast & Inventory Optimizer",
  
 st.title("Demand Forecast & Inventory Optimization Pipeline")
 st.markdown("Built with Prophet forecasting and ISE inventory principles.")
+
+if not os.path.exists(PARQUET_PATH):
+    st.error(
+        f"No dataset found at `{PARQUET_PATH}`.\n\n"
+        "Run `python src/data_prep.py` to build it from the raw M5 CSVs, or "
+        "`python scripts/build_demo_data.py` to create the smaller demo subset."
+    )
+    st.stop()
+
+if USING_DEMO_DATA:
+    st.info(
+        "**Demo dataset.** This deployment runs on a subset of the M5 data covering "
+        "the item/store combinations that have saved forecast runs, because "
+        "Streamlit Community Cloud cannot hold the full 46M-row dataset in memory. "
+        "The pipeline, forecasting, and inventory logic are identical to the full "
+        "version; only the catalog is smaller. Clone the repo and run "
+        "`src/data_prep.py` to work with everything."
+    )
  
 @st.cache_data
 def load_cached_data():
-    df = load_data('data/sales_clean.parquet')
+    df = load_data(PARQUET_PATH)
     return df[['item_id', 'store_id', 'state_id',
                 'cat_id', 'dept_id', 'date', 'sales', 'sell_price']]
  
@@ -39,6 +58,119 @@ def get_product_demand_summary(df):
     return summary
  
 demand_summary = get_product_demand_summary(sales_clean)
+
+
+def _available_categories():
+    """Categories that actually have items in the loaded dataset.
+
+    Options are derived from the data rather than from CATEGORY_LABELS so a
+    trimmed dataset (the deployed demo, or any filtered subset) can't produce
+    an empty dropdown that breaks st.selectbox.
+    """
+    present = set(demand_summary['cat_id'].unique())
+    return sorted(CATEGORY_LABELS[c] for c in CATEGORY_LABELS if c in present)
+
+
+def _available_departments(cat_id):
+    """Departments within a category that have items in the loaded dataset."""
+    present = set(demand_summary[demand_summary['cat_id'] == cat_id]['dept_id'].unique())
+    return sorted(DEPT_LABELS[d] for d in DEPT_LABELS if d in present)
+
+
+def _available_stores(state_id):
+    """Stores in a state that have items in the loaded dataset."""
+    present = set(sales_clean['store_id'].unique())
+    return [s for s in STORES_BY_STATE[state_id] if s in present]
+
+
+def _available_states():
+    present_stores = set(sales_clean['store_id'].unique())
+    return sorted(
+        STATE_LABELS[s] for s in STATE_LABELS
+        if any(store in present_stores for store in STORES_BY_STATE[s])
+    )
+
+
+def render_product_selector(key_prefix, sidebar=False, label_suffix="", cat_index=0):
+    """
+    Render the Category -> Department -> Product cascade and return
+    (product_id, cat_id).
+
+    sidebar=True renders in the sidebar with a subheader above each collapsed
+    widget (Tab 1 style); sidebar=False renders inline with a visible label,
+    optionally suffixed (" A" / " B" for the side-by-side comparison in Tab 2).
+    The selection logic is identical either way, only the presentation differs.
+    """
+    container = st.sidebar if sidebar else st
+
+    def selectbox(label, options, index=0, key=None):
+        if sidebar:
+            container.subheader(label)
+            return container.selectbox(label, options, index=index,
+                                       label_visibility="collapsed", key=key)
+        return container.selectbox(f"{label}{label_suffix}", options,
+                                   index=index, key=key)
+
+    cat_options = _available_categories()
+    cat_label = selectbox("Category", cat_options,
+                          index=min(cat_index, len(cat_options) - 1),
+                          key=f"{key_prefix}_cat")
+    cat_id = {v: k for k, v in CATEGORY_LABELS.items()}[cat_label]
+
+    dept_label = selectbox("Department", _available_departments(cat_id),
+                           key=f"{key_prefix}_dept")
+    dept_id = {v: k for k, v in DEPT_LABELS.items()}[dept_label]
+
+    dept_products = demand_summary[demand_summary['dept_id'] == dept_id].copy()
+    dept_products = dept_products.sort_values('avg_daily_demand', ascending=False)
+    dept_products['label'] = (
+        dept_products['item_id'] + "  —  " +
+        dept_products['avg_daily_demand'].map(lambda x: f"{x:.2f} units/day")
+    )
+    product_label = selectbox("Product (sorted by avg demand ↓)",
+                              dept_products['label'].tolist(),
+                              key=f"{key_prefix}_prod")
+    product_id = dept_products[
+        dept_products['label'] == product_label]['item_id'].values[0]
+
+    return product_id, cat_id
+
+
+def render_store_selector(key_prefix, sidebar=False, containers=None):
+    """
+    Render the State -> Store cascade and return (store_id, store_label).
+
+    containers, if given, is a (state_container, store_container) tuple — two
+    st.columns(), for instance — letting the caller control layout. Without it,
+    both render into the sidebar or into the main body depending on `sidebar`.
+    """
+    if containers is not None:
+        state_container, store_container = containers
+    elif sidebar:
+        state_container = store_container = st.sidebar
+    else:
+        state_container = store_container = st
+
+    def selectbox(container, label, options, key=None):
+        if sidebar:
+            container.subheader(label)
+            return container.selectbox(label, options,
+                                       label_visibility="collapsed", key=key)
+        return container.selectbox(label, options, key=key)
+
+    state_label = selectbox(state_container, "State", _available_states(),
+                            key=f"{key_prefix}_state")
+    state_id = {v: k for k, v in STATE_LABELS.items()}[state_label]
+
+    store_ids = _available_stores(state_id)
+    short_options = [STORE_SHORT_LABELS[s] for s in store_ids]
+    store_short = selectbox(store_container, "Store", short_options,
+                            key=f"{key_prefix}_store")
+    store_id = store_ids[short_options.index(store_short)]
+
+    return store_id, STORE_LABELS[store_id]
+
+
  
 @st.cache_data
 def run_pipeline(product_id, store_id, forecast_days,
@@ -64,52 +196,10 @@ tab1, tab2, tab3 = st.tabs(["📈 Single Product", "🔍 Compare Products", "�
 with tab1:
  
     st.sidebar.header("① Product Selection")
- 
-    st.sidebar.subheader("Category")
-    selected_category_label = st.sidebar.selectbox(
-        "Category", sorted(CATEGORY_LABELS.values()),
-        label_visibility="collapsed", key="t1_cat")
-    selected_cat_id = {v: k for k, v in CATEGORY_LABELS.items()}[selected_category_label]
- 
-    st.sidebar.subheader("Department")
-    dept_options_raw = sorted([k for k in DEPT_LABELS if k.startswith(selected_cat_id)])
-    dept_options_labels = [DEPT_LABELS[d] for d in dept_options_raw]
-    selected_dept_label = st.sidebar.selectbox(
-        "Department", dept_options_labels,
-        label_visibility="collapsed", key="t1_dept")
-    selected_dept_id = {v: k for k, v in DEPT_LABELS.items()}[selected_dept_label]
- 
-    st.sidebar.subheader("Product  (sorted by avg demand ↓)")
-    dept_products = demand_summary[demand_summary['dept_id'] == selected_dept_id].copy()
-    dept_products = dept_products.sort_values('avg_daily_demand', ascending=False)
-    dept_products['label'] = (
-        dept_products['item_id'] + "  —  " +
-        dept_products['avg_daily_demand'].map(lambda x: f"{x:.2f} units/day")
-    )
-    selected_product_label = st.sidebar.selectbox(
-        "Product", dept_products['label'].tolist(),
-        label_visibility="collapsed", key="t1_prod")
-    product_id = dept_products[
-        dept_products['label'] == selected_product_label]['item_id'].values[0]
-    cat_id = selected_cat_id
- 
+    product_id, cat_id = render_product_selector("t1", sidebar=True)
+
     st.sidebar.header("① Store Selection")
- 
-    st.sidebar.subheader("State")
-    state_options = sorted(STATE_LABELS.values())
-    selected_state_label = st.sidebar.selectbox(
-        "State", state_options,
-        label_visibility="collapsed", key="t1_state")
-    selected_state_id = {v: k for k, v in STATE_LABELS.items()}[selected_state_label]
- 
-    st.sidebar.subheader("Store")
-    store_ids_in_state = STORES_BY_STATE[selected_state_id]
-    store_short_options = [STORE_SHORT_LABELS[s] for s in store_ids_in_state]
-    selected_store_short = st.sidebar.selectbox(
-        "Store", store_short_options,
-        label_visibility="collapsed", key="t1_store")
-    store_id = store_ids_in_state[store_short_options.index(selected_store_short)]
-    selected_store_label = STORE_LABELS[store_id]
+    store_id, selected_store_label = render_store_selector("t1", sidebar=True)
  
     st.sidebar.header("Inventory Parameters")
     lead_time = st.sidebar.slider("Lead Time (days)", 1, 30, 7)
@@ -362,59 +452,16 @@ with tab2:
  
     with pcol1:
         st.markdown("#### Product A")
-        cat_a_label = st.selectbox(
-            "Category A", sorted(CATEGORY_LABELS.values()), key="cmp_cat_a")
-        cat_a_id = {v: k for k, v in CATEGORY_LABELS.items()}[cat_a_label]
- 
-        dept_a_raw = sorted([k for k in DEPT_LABELS if k.startswith(cat_a_id)])
-        dept_a_label = st.selectbox(
-            "Department A", [DEPT_LABELS[d] for d in dept_a_raw], key="cmp_dept_a")
-        dept_a_id = {v: k for k, v in DEPT_LABELS.items()}[dept_a_label]
- 
-        prods_a = demand_summary[demand_summary['dept_id'] == dept_a_id].copy()
-        prods_a = prods_a.sort_values('avg_daily_demand', ascending=False)
-        prods_a['label'] = (
-            prods_a['item_id'] + "  —  " +
-            prods_a['avg_daily_demand'].map(lambda x: f"{x:.2f} units/day")
-        )
-        prod_a_label = st.selectbox(
-            "Product A (sorted by avg demand ↓)", prods_a['label'].tolist(), key="cmp_prod_a")
-        product_a_id = prods_a[prods_a['label'] == prod_a_label]['item_id'].values[0]
- 
+        product_a_id, cat_a_id = render_product_selector("cmp_a", label_suffix=" A")
+
     with pcol2:
         st.markdown("#### Product B")
-        cat_b_label = st.selectbox(
-            "Category B", sorted(CATEGORY_LABELS.values()),
-            index=1, key="cmp_cat_b")
-        cat_b_id = {v: k for k, v in CATEGORY_LABELS.items()}[cat_b_label]
- 
-        dept_b_raw = sorted([k for k in DEPT_LABELS if k.startswith(cat_b_id)])
-        dept_b_label = st.selectbox(
-            "Department B", [DEPT_LABELS[d] for d in dept_b_raw], key="cmp_dept_b")
-        dept_b_id = {v: k for k, v in DEPT_LABELS.items()}[dept_b_label]
- 
-        prods_b = demand_summary[demand_summary['dept_id'] == dept_b_id].copy()
-        prods_b = prods_b.sort_values('avg_daily_demand', ascending=False)
-        prods_b['label'] = (
-            prods_b['item_id'] + "  —  " +
-            prods_b['avg_daily_demand'].map(lambda x: f"{x:.2f} units/day")
-        )
-        prod_b_label = st.selectbox(
-            "Product B (sorted by avg demand ↓)", prods_b['label'].tolist(), key="cmp_prod_b")
-        product_b_id = prods_b[prods_b['label'] == prod_b_label]['item_id'].values[0]
- 
+        product_b_id, cat_b_id = render_product_selector("cmp_b", label_suffix=" B",
+                                                         cat_index=1)
+
     st.markdown("#### Shared Store")
     scol1, scol2, _ = st.columns([1, 1, 2])
-    with scol1:
-        cmp_state_label = st.selectbox(
-            "State", sorted(STATE_LABELS.values()), key="cmp_state")
-        cmp_state_id = {v: k for k, v in STATE_LABELS.items()}[cmp_state_label]
-    with scol2:
-        cmp_store_ids = STORES_BY_STATE[cmp_state_id]
-        cmp_short_labels = [STORE_SHORT_LABELS[s] for s in cmp_store_ids]
-        cmp_store_short = st.selectbox("Store", cmp_short_labels, key="cmp_store")
-        cmp_store_id = cmp_store_ids[cmp_short_labels.index(cmp_store_short)]
-        cmp_store_label = STORE_LABELS[cmp_store_id]
+    cmp_store_id, cmp_store_label = render_store_selector("cmp", containers=(scol1, scol2))
  
     st.divider()
  
