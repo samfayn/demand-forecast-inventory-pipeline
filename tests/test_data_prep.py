@@ -64,3 +64,40 @@ def test_load_data_reads_parquet_file(tmp_path):
 
     pd.testing.assert_frame_equal(loaded.reset_index(drop=True),
                                    df.reset_index(drop=True))
+
+# ---------------------------------------------------------------------------
+# Indexed lookup path used by the batch runner
+# ---------------------------------------------------------------------------
+
+from pipeline import build_series_index, get_indexed_item
+
+
+def test_indexed_lookup_matches_scan_lookup():
+    """build_series_index + get_indexed_item is an optimization, so it must
+    return exactly what the straightforward scan returns."""
+    df = make_sales_frame()
+    indexed = build_series_index(df)
+
+    cols = ['item_id', 'store_id', 'date', 'sales', 'sell_price']
+    scanned = get_single_item(df, 'FOODS_1_001', 'CA_1')[cols].sort_values('date').reset_index(drop=True)
+    looked_up = get_indexed_item(indexed, 'FOODS_1_001', 'CA_1')[cols].sort_values('date').reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(scanned, looked_up)
+
+
+def test_indexed_lookup_returns_empty_for_missing_combination():
+    """Must match get_single_item's behavior of returning an empty frame
+    rather than raising, so callers can use one 'not enough data' branch."""
+    indexed = build_series_index(make_sales_frame())
+    result = get_indexed_item(indexed, 'NO_SUCH_ITEM', 'CA_1')
+
+    assert len(result) == 0
+    assert isinstance(result, pd.DataFrame)
+
+
+def test_indexed_lookup_does_not_leak_other_stores():
+    indexed = build_series_index(make_sales_frame())
+    result = get_indexed_item(indexed, 'FOODS_1_001', 'CA_1')
+
+    assert (result['store_id'] == 'CA_1').all()
+    assert (result['item_id'] == 'FOODS_1_001').all()

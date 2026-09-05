@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from pipeline import (compute_backtest_metrics, evaluate_forecast,
+from pipeline import (compute_backtest_metrics, compute_mase, evaluate_forecast,
                        train_forecast, ForecastingError)
 
 
@@ -27,9 +27,22 @@ def test_mape_ignores_zero_actual_days():
     assert metrics['rmse'] == pytest.approx(expected_rmse)
 
 
-def test_returns_none_when_all_actuals_are_zero():
+def test_mape_is_none_but_rmse_survives_when_all_actuals_are_zero():
+    """MAPE is undefined when every actual is zero, but RMSE is not. The
+    metrics dict should report mape=None and still carry a usable RMSE
+    rather than discarding the whole result."""
     comparison = pd.DataFrame({'y': [0.0, 0.0, 0.0], 'yhat': [1.0, 2.0, 0.5]})
-    assert compute_backtest_metrics(comparison) is None
+    metrics = compute_backtest_metrics(comparison)
+
+    assert metrics is not None
+    assert metrics['mape'] is None
+    expected_rmse = ((1.0**2 + 2.0**2 + 0.5**2) / 3) ** 0.5
+    assert metrics['rmse'] == pytest.approx(expected_rmse)
+
+
+def test_returns_none_only_when_there_is_nothing_to_score():
+    empty = pd.DataFrame({'y': [], 'yhat': []})
+    assert compute_backtest_metrics(empty) is None
 
 
 def test_perfect_prediction_gives_zero_mape_and_rmse():
@@ -117,7 +130,10 @@ class _AllZeroHoldoutProphet:
         })
 
 
-def test_evaluate_forecast_returns_none_when_holdout_actuals_all_zero(monkeypatch):
+def test_evaluate_forecast_reports_none_mape_but_keeps_rmse_on_zero_holdout(monkeypatch):
+    """A holdout window with no sales at all used to discard the entire
+    backtest. It should now return a result with mape=None, since RMSE (and
+    MASE, when the training series supports it) remain well defined."""
     import pipeline
     monkeypatch.setattr(pipeline, "Prophet", _AllZeroHoldoutProphet)
 
@@ -125,7 +141,69 @@ def test_evaluate_forecast_returns_none_when_holdout_actuals_all_zero(monkeypatc
         'ds': pd.date_range('2025-01-01', periods=200),
         'y': [1.0] * 110 + [0.0] * 90,  # holdout window (last 90 days) is all zero
     })
-    assert evaluate_forecast(df_prophet, holdout_days=90) is None
+    result = evaluate_forecast(df_prophet, holdout_days=90)
+
+    assert result is not None
+    assert result['mape'] is None
+    assert result['rmse'] is not None
+
+
+# ---------------------------------------------------------------------------
+# MASE — scaled against a seasonal naive baseline
+# ---------------------------------------------------------------------------
+
+def test_mase_of_one_means_model_matches_naive_baseline():
+    """If the model's MAE equals the seasonal naive MAE, MASE is exactly 1.0."""
+    # training series alternates blocks of 0 and 2 every 7 days, so the
+    # seasonal naive error is a constant 2.0
+    train = [0.0] * 7 + [2.0] * 7 + [0.0] * 7 + [2.0] * 7
+    # model is off by exactly 2.0 on every holdout day
+    mase = compute_mase(actual=[10.0, 10.0], predicted=[12.0, 8.0], train_series=train)
+    assert mase == pytest.approx(1.0)
+
+
+def test_mase_below_one_means_model_beats_naive():
+    train = [0.0] * 7 + [2.0] * 7 + [0.0] * 7 + [2.0] * 7  # naive MAE = 2.0
+    mase = compute_mase(actual=[10.0, 10.0], predicted=[11.0, 9.0], train_series=train)
+    assert mase == pytest.approx(0.5)
+    assert mase < 1.0
+
+
+def test_mase_is_zero_for_a_perfect_forecast():
+    train = [0.0] * 7 + [2.0] * 7 + [0.0] * 7 + [2.0] * 7
+    assert compute_mase([5.0, 5.0], [5.0, 5.0], train) == pytest.approx(0.0)
+
+
+def test_mase_is_defined_when_all_actuals_are_zero():
+    """The property that makes MASE the right metric for intermittent demand:
+    unlike MAPE, it survives a holdout window with no sales."""
+    train = [0.0] * 7 + [2.0] * 7 + [0.0] * 7 + [2.0] * 7
+    mase = compute_mase(actual=[0.0, 0.0], predicted=[1.0, 1.0], train_series=train)
+    assert mase is not None
+    assert mase == pytest.approx(0.5)
+
+
+def test_mase_returns_none_for_perfectly_periodic_training_series():
+    """A training series that repeats exactly gives a seasonal naive error of
+    zero, making the scaling factor undefined. Return None rather than
+    dividing by zero."""
+    train = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] * 5
+    assert compute_mase([1.0], [2.0], train) is None
+
+
+def test_mase_returns_none_when_training_series_shorter_than_season():
+    assert compute_mase([1.0], [1.0], [1.0, 2.0, 3.0], seasonal_period=7) is None
+
+
+def test_compute_backtest_metrics_includes_mase_when_train_series_given():
+    comparison = pd.DataFrame({'y': [10.0, 10.0], 'yhat': [11.0, 9.0]})
+    train = [0.0] * 7 + [2.0] * 7 + [0.0] * 7 + [2.0] * 7
+
+    without = compute_backtest_metrics(comparison)
+    with_train = compute_backtest_metrics(comparison, train_series=train)
+
+    assert without['mase'] is None
+    assert with_train['mase'] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -163,3 +241,37 @@ def test_evaluate_forecast_real_prophet_success_path():
     assert result['rmse'] >= 0
     assert result['holdout_days'] == 90
     assert len(result['comparison']) <= 90
+
+class _NonOverlappingProphet:
+    """Predicts dates that don't intersect the holdout window at all, so the
+    merge produces an empty comparison. Exercises evaluate_forecast's
+    'nothing to score' guard."""
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fit(self, df):
+        self._last_ds = df['ds']
+
+    def make_future_dataframe(self, periods):
+        # dates far in the future, deliberately disjoint from the actuals
+        far = pd.date_range('2099-01-01', periods=periods)
+        return pd.DataFrame({'ds': far})
+
+    def predict(self, future):
+        return pd.DataFrame({
+            'ds': future['ds'],
+            'yhat': [1.0] * len(future),
+            'yhat_lower': [0.0] * len(future),
+            'yhat_upper': [2.0] * len(future),
+        })
+
+
+def test_evaluate_forecast_returns_none_when_no_overlapping_dates(monkeypatch):
+    import pipeline
+    monkeypatch.setattr(pipeline, "Prophet", _NonOverlappingProphet)
+
+    df_prophet = pd.DataFrame({
+        'ds': pd.date_range('2025-01-01', periods=200),
+        'y': [5.0] * 200,
+    })
+    assert evaluate_forecast(df_prophet, holdout_days=90) is None

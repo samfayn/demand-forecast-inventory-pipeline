@@ -35,7 +35,7 @@ def make_fake_inv(avg_demand):
     }
 
 
-FAKE_EVAL = {'mape': 12.5, 'rmse': 1.1}
+FAKE_EVAL = {'mape': 12.5, 'rmse': 1.1, 'mase': 0.83}
 
 
 def test_save_and_load_round_trip():
@@ -51,6 +51,21 @@ def test_save_and_load_round_trip():
     assert row['store_id'] == 'CA_1'
     assert row['service_level'] == pytest.approx(0.90)
     assert row['avg_daily_demand'] == pytest.approx(6.0)
+    assert row['mase'] == pytest.approx(0.83)
+
+
+def test_mase_persists_as_null_when_undefined():
+    """A backtest that couldn't produce a MASE (perfectly periodic training
+    series, too little history) should store NULL rather than a placeholder
+    number that would pollute aggregate statistics."""
+    eval_no_mase = {'mape': 20.0, 'rmse': 2.0, 'mase': None}
+    save_results_to_db('FOODS_1_003', 'CA_1', make_fake_inv(4.0), eval_no_mase,
+                        90, 7, 10.0, 0.2, service_level=0.95)
+
+    runs = load_all_runs()
+    row = runs[runs['item_id'] == 'FOODS_1_003'].iloc[0]
+    assert pd.isna(row['mase'])
+    assert row['mape'] == pytest.approx(20.0)
 
 
 def test_run_ids_increment_across_saves():

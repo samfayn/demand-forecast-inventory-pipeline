@@ -75,6 +75,35 @@ def get_single_item(df, product_id, store_id):
     ].copy()
 
 
+def build_series_index(df):
+    """
+    Build a sorted MultiIndex on (item_id, store_id) for fast repeated lookups.
+
+    get_single_item scans the whole frame on every call, which is fine for the
+    dashboard (one selection at a time) but costs roughly a second per lookup
+    on a 46M-row frame. A batch sweep doing hundreds of lookups pays that
+    repeatedly. Sorting once up front turns each subsequent lookup into a
+    binary search.
+
+    Use with get_indexed_item(). The one-time sort costs a few seconds and
+    pays for itself after a handful of lookups.
+    """
+    return df.set_index(['item_id', 'store_id']).sort_index()
+
+
+def get_indexed_item(indexed_df, product_id, store_id):
+    """
+    Look up one product/store series from a frame prepared by
+    build_series_index(). Returns an empty DataFrame if the combination
+    isn't present, matching get_single_item's behavior rather than raising.
+    """
+    try:
+        result = indexed_df.loc[[(product_id, store_id)]]
+    except KeyError:
+        return pd.DataFrame(columns=indexed_df.columns)
+    return result.reset_index()
+
+
 def prepare_prophet_df(item_df):
     return item_df[['date', 'sales']].rename(columns={
         'date': 'ds',
@@ -101,28 +130,76 @@ def train_forecast(df_prophet, forecast_days=90):
         ) from e
 
 
-def compute_backtest_metrics(comparison):
+def compute_mase(actual, predicted, train_series, seasonal_period=7):
+    """
+    Mean Absolute Scaled Error (Hyndman & Koehler, 2006).
+
+    Scales the model's mean absolute error by the mean absolute error of a
+    seasonal naive forecast ("next Tuesday looks like last Tuesday") computed
+    on the *training* data. The result reads directly as a comparison against
+    that baseline:
+
+        MASE < 1  -> the model beats seasonal naive
+        MASE = 1  -> the model matches it
+        MASE > 1  -> the model is worse than doing nothing clever
+
+    Unlike MAPE, MASE is defined when actuals are zero, which is why it's the
+    standard recommendation for intermittent demand. seasonal_period defaults
+    to 7 for daily retail data with weekly seasonality.
+
+    Returns None when the scaling factor can't be computed: too little
+    training history, or a perfectly periodic training series (a flat or
+    all-zero series makes the naive error zero, so the ratio is undefined).
+    """
+    train_series = np.asarray(train_series, dtype=float)
+
+    if len(train_series) <= seasonal_period:
+        return None
+
+    naive_errors = np.abs(train_series[seasonal_period:] - train_series[:-seasonal_period])
+    scale = naive_errors.mean()
+
+    if scale == 0 or not np.isfinite(scale):
+        return None
+
+    mae = np.abs(np.asarray(actual, dtype=float) - np.asarray(predicted, dtype=float)).mean()
+    return mae / scale
+
+
+def compute_backtest_metrics(comparison, train_series=None, seasonal_period=7):
     """
     Pure function: given a comparison DataFrame with 'y' (actual) and 'yhat'
-    (predicted, already clipped to >= 0) columns, computes MAPE and RMSE.
+    (predicted, already clipped to >= 0) columns, computes MAPE, RMSE and
+    (when train_series is supplied) MASE.
 
     MAPE is computed only over rows where actual sales > 0, since percentage
     error is undefined at zero and intermittent retail demand contains many
-    zero-sales days. RMSE uses all rows. Returns None if there are no
-    nonzero-actual rows to compute MAPE over.
-    """
-    nonzero = comparison[comparison['y'] > 0]
+    zero-sales days; it comes back as None when no such rows exist. RMSE and
+    MASE use all rows and are reported regardless, so a metric that is well
+    defined isn't discarded just because MAPE isn't.
 
-    if len(nonzero) == 0:
+    Returns None only when there is nothing to score at all.
+    """
+    if len(comparison) == 0:
         return None
 
-    mape = (np.abs(nonzero['y'] - nonzero['yhat']) / nonzero['y']).mean() * 100
+    nonzero = comparison[comparison['y'] > 0]
+    if len(nonzero) > 0:
+        mape = (np.abs(nonzero['y'] - nonzero['yhat']) / nonzero['y']).mean() * 100
+    else:
+        mape = None
+
     rmse = np.sqrt(((comparison['y'] - comparison['yhat']) ** 2).mean())
 
-    return {'mape': mape, 'rmse': rmse}
+    mase = None
+    if train_series is not None:
+        mase = compute_mase(comparison['y'], comparison['yhat'],
+                            train_series, seasonal_period=seasonal_period)
+
+    return {'mape': mape, 'rmse': rmse, 'mase': mase}
 
 
-def evaluate_forecast(df_prophet, holdout_days=90):
+def evaluate_forecast(df_prophet, holdout_days=90, seasonal_period=7):
     """
     Holdout backtest: train on all data except the last holdout_days,
     then compare forecast to actuals. Returns None if not enough data.
@@ -157,13 +234,15 @@ def evaluate_forecast(df_prophet, holdout_days=90):
     comparison = actual_df.merge(holdout_forecast, on='ds', how='inner')
     comparison['yhat'] = comparison['yhat'].clip(lower=0)
 
-    metrics = compute_backtest_metrics(comparison)
+    metrics = compute_backtest_metrics(comparison, train_series=train_df['y'],
+                                       seasonal_period=seasonal_period)
     if metrics is None:
         return None
 
     return {
         'mape': metrics['mape'],
         'rmse': metrics['rmse'],
+        'mase': metrics['mase'],
         'comparison': comparison,
         'holdout_days': holdout_days
     }
@@ -219,7 +298,8 @@ def _init_db(con):
             rop              DOUBLE,
             eoq              DOUBLE,
             mape             DOUBLE,
-            rmse             DOUBLE
+            rmse             DOUBLE,
+            mase             DOUBLE
         )
     """)
 
@@ -247,19 +327,20 @@ def save_results_to_db(item_id, store_id, inv, eval_results,
 
             mape = eval_results['mape'] if eval_results else None
             rmse = eval_results['rmse'] if eval_results else None
+            mase = eval_results.get('mase') if eval_results else None
 
             con.execute("""
                 INSERT INTO forecast_runs (
                     run_id, run_at, item_id, store_id,
                     forecast_days, lead_time_days, ordering_cost, holding_cost, service_level,
-                    avg_daily_demand, std_daily_demand, safety_stock, rop, eoq, mape, rmse
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    avg_daily_demand, std_daily_demand, safety_stock, rop, eoq, mape, rmse, mase
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 run_id, datetime.now(), item_id, store_id,
                 forecast_days, lead_time, ordering_cost, holding_cost, service_level,
                 inv['avg_daily_demand'], inv['std_daily_demand'],
                 inv['safety_stock'], inv['rop'], inv['eoq'],
-                mape, rmse
+                mape, rmse, mase
             ])
 
             daily_df = inv['future_forecast'][['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
@@ -287,7 +368,8 @@ def load_all_runs(limit=200):
                     ROUND(rop, 1)              AS rop,
                     ROUND(eoq, 1)              AS eoq,
                     ROUND(mape, 1)             AS mape,
-                    ROUND(rmse, 2)             AS rmse
+                    ROUND(rmse, 2)             AS rmse,
+                    ROUND(mase, 3)             AS mase
                 FROM forecast_runs
                 ORDER BY run_at DESC
                 LIMIT {limit}
@@ -348,7 +430,8 @@ def query_runs(item_id=None, store_id=None, top_n_by_demand=None):
                     ROUND(rop, 1)              AS rop,
                     ROUND(eoq, 1)              AS eoq,
                     ROUND(mape, 1)             AS mape,
-                    ROUND(rmse, 2)             AS rmse
+                    ROUND(rmse, 2)             AS rmse,
+                    ROUND(mase, 3)             AS mase
                 FROM forecast_runs
                 {where_clause}
                 ORDER BY avg_daily_demand DESC

@@ -172,39 +172,66 @@ with tab1:
         else:
             mape = eval_results['mape']
             rmse = eval_results['rmse']
+            mase = eval_results.get('mase')
             avg_demand = inv['avg_daily_demand']
             is_intermittent = avg_demand < 1.5
  
-            if mape < 20:   mape_label = f"✅ {mape:.1f}%"
-            elif mape < 40: mape_label = f"⚠️ {mape:.1f}%"
-            else:           mape_label = f"🔴 {mape:.1f}%"
+            if mase is None:
+                mase_label = "N/A"
+            elif mase < 1.0:
+                mase_label = f"✅ {mase:.2f}"
+            elif mase < 1.2:
+                mase_label = f"⚠️ {mase:.2f}"
+            else:
+                mase_label = f"🔴 {mase:.2f}"
  
-            acol1, acol2, acol3 = st.columns(3)
-            acol1.metric("MAPE (Mean Abs % Error)", mape_label,
-                         help="Lower is better. Measures average % error on non-zero sales days.")
+            if mape is None:
+                mape_label = "N/A"
+            elif mape < 20:
+                mape_label = f"{mape:.1f}%"
+            elif mape < 40:
+                mape_label = f"{mape:.1f}%"
+            else:
+                mape_label = f"{mape:.1f}%"
+ 
+            acol1, acol2, acol3, acol4 = st.columns(4)
+            acol1.metric("MASE (vs seasonal naive)", mase_label,
+                         help="The headline accuracy metric. Below 1.0 means the model beats a "
+                              "seasonal naive forecast ('next Tuesday looks like last Tuesday'). "
+                              "Above 1.0 means it doesn't. Unlike MAPE, MASE is defined when "
+                              "sales are zero, so it works on intermittent demand.")
             acol2.metric("RMSE (Root Mean Sq Error)", f"{rmse:.2f} units",
-                         help="Lower is better. Penalizes large errors more heavily than MAPE.")
-            acol3.metric("Holdout Window", "Last 90 days",
+                         help="Average error in units. Interpretable on the same scale as demand.")
+            acol3.metric("MAPE (Mean Abs % Error)", mape_label,
+                         help="Shown for reference. Unreliable on low-volume items and undefined "
+                              "on zero-sales days, so it is not the metric to judge this on.")
+            acol4.metric("Holdout Window", "Last 90 days",
                          help="Model trained on all data before this window, then tested against it.")
  
-            if is_intermittent:
+            if mase is not None and mase >= 1.0:
                 st.warning(
-                    f"**Intermittent demand detected** (avg {avg_demand:.2f} units/day). "
-                    f"MAPE is less meaningful for low-volume items — being off by 1 unit on a day "
-                    f"with 1 actual sale registers as 100% error, even though the absolute mistake "
-                    f"is small. For items like this, **RMSE ({rmse:.2f} units)** is a more reliable "
-                    f"accuracy signal, and the shape of the backtest chart below matters more than "
-                    f"the MAPE number. This is a known limitation of MAPE on intermittent retail "
-                    f"demand — it's why the M5 Kaggle competition used WRMSSE (weighted RMSE) instead."
+                    f"**This model does not beat a seasonal naive baseline** (MASE {mase:.2f}). "
+                    f"For this item, simply repeating what happened the same weekday last week "
+                    f"would be about as accurate as the fitted Prophet model. That is a real "
+                    f"result worth knowing: the forecast machinery is not adding value here, and "
+                    f"the inventory policy below is only as good as its demand estimate."
                 )
-            elif mape > 40:
+            elif mase is not None:
+                st.success(
+                    f"**Beats the seasonal naive baseline** (MASE {mase:.2f}). The model's average "
+                    f"error is {(1 - mase) * 100:.0f}% smaller than simply repeating the same "
+                    f"weekday from the previous week."
+                )
+ 
+            if is_intermittent:
                 st.info(
-                    "**Note on this MAPE:** Retail demand forecasting at the individual item level "
-                    "is genuinely difficult. The M5 dataset (real Walmart data) is a well-known "
-                    "benchmark where even competition-winning ensemble models achieve MAPEs in this "
-                    "range. A single-item Prophet model capturing weekly and yearly seasonality is "
-                    "the right tool for interpretable, actionable forecasts — the backtest chart "
-                    "below shows whether the model is tracking the right patterns."
+                    f"**Intermittent demand** (avg {avg_demand:.2f} units/day). Read MASE and RMSE "
+                    f"here, not MAPE. Being off by 1 unit on a day with 1 actual sale registers as "
+                    f"100% error even though the absolute miss is tiny, which is why MAPE reads so "
+                    f"high across this dataset. Across a 200-combination sweep of this catalog the "
+                    f"median MAPE was 73.6% while the median RMSE was 0.79 units, describing the "
+                    f"same forecasts. The M5 competition avoided MAPE for the same reason and "
+                    f"scored on WRMSSE instead."
                 )
  
             comp = eval_results['comparison']
@@ -215,8 +242,10 @@ with tab1:
                          color='red', linewidth=2, label='Model Prediction')
             ax_eval.fill_between(comp['ds'], comp['yhat_lower'], comp['yhat_upper'],
                                  alpha=0.15, color='red', label='Uncertainty Band')
+            title_metric = f"MASE: {mase:.2f}" if mase is not None else (
+                f"MAPE: {mape:.1f}%" if mape is not None else "no scoreable days")
             ax_eval.set_title(
-                f'Backtest: Actual vs Predicted (last 90 days) — MAPE: {mape:.1f}%')
+                f'Backtest: Actual vs Predicted (last 90 days) — {title_metric}')
             ax_eval.set_xlabel('Date')
             ax_eval.set_ylabel('Units Sold')
             ax_eval.legend()
@@ -425,12 +454,19 @@ with tab2:
  
         st.subheader("📊 Head-to-Head Comparison")
  
+        def mase_str(eval_res):
+            if eval_res is None: return "N/A"
+            m = eval_res.get('mase')
+            if m is None: return "N/A"
+            if m < 1.0:   return f"✅ {m:.2f}"
+            elif m < 1.2: return f"⚠️ {m:.2f}"
+            else:         return f"🔴 {m:.2f}"
+ 
         def mape_str(eval_res):
             if eval_res is None: return "N/A"
             m = eval_res['mape']
-            if m < 20:   return f"✅ {m:.1f}%"
-            elif m < 40: return f"⚠️ {m:.1f}%"
-            else:        return f"🔴 {m:.1f}%"
+            if m is None: return "N/A"
+            return f"{m:.1f}%"
  
         def rmse_str(eval_res):
             if eval_res is None: return "N/A"
@@ -444,8 +480,9 @@ with tab2:
                 "Safety Stock",
                 "Reorder Point (ROP)",
                 "Economic Order Qty (EOQ)",
-                "MAPE (Backtest)",
+                "MASE (vs seasonal naive)",
                 "RMSE (Backtest)",
+                "MAPE (Backtest)",
             ],
             f"Product A — {product_a_id}": [
                 f"{inv_a['avg_daily_demand']:.2f} units/day",
@@ -454,8 +491,9 @@ with tab2:
                 f"{inv_a['safety_stock']:.1f} units",
                 f"{inv_a['rop']:.1f} units",
                 f"{inv_a['eoq']:.1f} units",
-                mape_str(eval_a),
+                mase_str(eval_a),
                 rmse_str(eval_a),
+                mape_str(eval_a),
             ],
             f"Product B — {product_b_id}": [
                 f"{inv_b['avg_daily_demand']:.2f} units/day",
@@ -464,8 +502,9 @@ with tab2:
                 f"{inv_b['safety_stock']:.1f} units",
                 f"{inv_b['rop']:.1f} units",
                 f"{inv_b['eoq']:.1f} units",
-                mape_str(eval_b),
+                mase_str(eval_b),
                 rmse_str(eval_b),
+                mape_str(eval_b),
             ],
         }
  
@@ -538,13 +577,24 @@ with tab3:
                 "or **🔍 Compare Products** to populate this tab.")
         st.stop()
  
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Total Runs Saved", len(all_runs))
     k2.metric("Unique Products", int(all_runs['item_id'].nunique()))
     k3.metric("Unique Stores", int(all_runs['store_id'].nunique()))
-    valid_mapes = all_runs['mape'].dropna()
-    k4.metric("Avg MAPE (where available)",
-              f"{valid_mapes.mean():.1f}%" if not valid_mapes.empty else "N/A")
+
+    valid_mase = all_runs['mase'].dropna() if 'mase' in all_runs.columns else pd.Series(dtype=float)
+    if not valid_mase.empty:
+        beat_naive = (valid_mase < 1.0).sum()
+        k4.metric("Median MASE", f"{valid_mase.median():.2f}",
+                  help="Below 1.0 beats a seasonal naive forecast.")
+        k5.metric("Beat naive baseline", f"{beat_naive}/{len(valid_mase)}",
+                  help="Runs where the model outperformed seasonal naive.")
+    else:
+        k4.metric("Median MASE", "N/A",
+                  help="Re-run the batch script to populate MASE for saved runs.")
+        valid_mapes = all_runs['mape'].dropna()
+        k5.metric("Median MAPE",
+                  f"{valid_mapes.median():.1f}%" if not valid_mapes.empty else "N/A")
  
     st.divider()
  
@@ -563,7 +613,8 @@ with tab3:
         sort_options = {
             "Most recent first": ("run_at", False),
             "Highest avg demand": ("avg_daily_demand", False),
-            "Lowest MAPE (best fit)": ("mape", True),
+            "Lowest MASE (best fit)": ("mase", True),
+            "Lowest MAPE": ("mape", True),
             "Highest EOQ": ("eoq", False),
         }
         selected_sort_label = st.selectbox("Sort by", list(sort_options.keys()), key="db_sort")
@@ -589,8 +640,9 @@ with tab3:
         'safety_stock': 'Safety Stock',
         'rop': 'ROP',
         'eoq': 'EOQ',
-        'mape': 'MAPE (%)',
+        'mase': 'MASE',
         'rmse': 'RMSE',
+        'mape': 'MAPE (%)',
     }
     st.dataframe(
         filtered[list(display_cols.keys())].rename(columns=display_cols),  # type: ignore[call-overload]
@@ -642,7 +694,12 @@ with tab3:
                 rcol3.metric("Reorder Point", f"{run_meta['rop']:.1f} units")
                 rcol4.metric("EOQ", f"{run_meta['eoq']:.1f} units")
  
-                mape_val = run_meta['mape']
-                if pd.notna(mape_val):
-                    st.caption(f"Model accuracy on this run — MAPE: {mape_val:.1f}%  |  "
-                               f"RMSE: {run_meta['rmse']:.2f} units")
+                parts = []
+                if 'mase' in run_meta.index and pd.notna(run_meta['mase']):
+                    parts.append(f"MASE: {run_meta['mase']:.2f}")
+                if pd.notna(run_meta['rmse']):
+                    parts.append(f"RMSE: {run_meta['rmse']:.2f} units")
+                if pd.notna(run_meta['mape']):
+                    parts.append(f"MAPE: {run_meta['mape']:.1f}%")
+                if parts:
+                    st.caption("Model accuracy on this run — " + "  |  ".join(parts))

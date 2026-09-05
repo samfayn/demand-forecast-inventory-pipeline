@@ -32,8 +32,8 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from pipeline import (  # noqa: E402
-    load_data, get_single_item, prepare_prophet_df, train_forecast,
-    evaluate_forecast, calculate_inventory, save_results_to_db,
+    load_data, build_series_index, get_indexed_item, prepare_prophet_df,
+    train_forecast, evaluate_forecast, calculate_inventory, save_results_to_db,
     load_all_runs, ForecastingError, DatabaseError,
 )
 
@@ -44,17 +44,30 @@ logger = logging.getLogger(__name__)
 MIN_ROWS_PER_SERIES = 30
 
 
-def select_combinations(df, top_n=None, sample=None, stores=None, seed=42):
+def select_combinations(df, top_n=None, sample=None, stratified=None,
+                        stores=None, seed=42):
     """
     Build the list of (item_id, store_id) pairs to forecast.
 
-    top_n picks the highest-average-demand products within each store;
-    sample takes a random sample per store (reproducible via seed). Exactly
-    one of the two must be given — they answer different questions, and
-    silently combining them would make the resulting sweep hard to interpret.
+    Three mutually exclusive strategies, because they answer different
+    questions and mixing them would make the resulting sweep uninterpretable:
+
+      top_n       the highest-average-demand products in each store. Lands in
+                  the commercially important head of the catalog.
+      sample      a random sample per store. Representative of the catalog as
+                  a whole, which in retail means mostly the long tail: roughly
+                  a third of M5 item/store pairs are C-class by revenue, so a
+                  random draw is dominated by near-zero-demand series.
+      stratified  equal numbers from each decile of average demand. Gives
+                  balanced coverage across the whole demand spectrum, which is
+                  what you want for comparing forecast quality between
+                  high- and low-volume items without one group swamping the
+                  other.
     """
-    if (top_n is None) == (sample is None):
-        raise ValueError("Specify exactly one of --top-n or --sample.")
+    given = [x is not None for x in (top_n, sample, stratified)]
+    if sum(given) != 1:
+        raise ValueError(
+            "Specify exactly one of --top-n, --sample, or --stratified.")
 
     if stores:
         df = df[df['store_id'].isin(stores)]
@@ -68,6 +81,9 @@ def select_combinations(df, top_n=None, sample=None, stores=None, seed=42):
         .rename(columns={'sales': 'avg_daily_demand'})
     )
 
+    if stratified is not None:
+        return _stratified_combinations(per_store_demand, stratified, seed)
+
     combos = []
     for store_id, group in per_store_demand.groupby('store_id'):
         if top_n is not None:
@@ -76,6 +92,32 @@ def select_combinations(df, top_n=None, sample=None, stores=None, seed=42):
             n = min(sample, len(group))
             chosen = group.sample(n=n, random_state=seed)
         combos.extend((row.item_id, store_id) for row in chosen.itertuples())
+
+    return combos
+
+
+def _stratified_combinations(per_store_demand, per_decile, seed):
+    """
+    Sample per_decile combinations from each decile of average daily demand,
+    pooled across stores. Deciles are cut on the full distribution so every
+    band is equally represented in the output regardless of how skewed the
+    underlying catalog is.
+    """
+    ranked = per_store_demand.copy()
+    # rank-based deciles rather than value-based, since demand is heavily
+    # skewed and value-based cuts would leave some bands nearly empty
+    ranked['decile'] = pd.qcut(
+        ranked['avg_daily_demand'].rank(method='first'),
+        q=10, labels=False, duplicates='drop')
+
+    combos = []
+    for decile, group in ranked.groupby('decile'):
+        n = min(per_decile, len(group))
+        chosen = group.sample(n=n, random_state=seed + int(decile))
+        combos.extend((row.item_id, row.store_id) for row in chosen.itertuples())
+        logger.info("  decile %s: %s combos, demand %.3f to %.3f units/day",
+                    int(decile) + 1, n,
+                    group['avg_daily_demand'].min(), group['avg_daily_demand'].max())
 
     return combos
 
@@ -94,10 +136,13 @@ def already_saved_combinations():
     return set(zip(runs['item_id'], runs['store_id']))
 
 
-def run_one(sales_clean, item_id, store_id, args):
+def run_one(indexed_sales, item_id, store_id, args):
     """Forecast a single product/store combination and persist it.
-    Returns a result dict, or None if the combination was skipped or failed."""
-    item_df = get_single_item(sales_clean, item_id, store_id)
+    Returns a result dict, or None if the combination was skipped or failed.
+
+    indexed_sales comes from build_series_index() — a sorted MultiIndex frame,
+    so each lookup is a binary search rather than a full scan of 46M rows."""
+    item_df = get_indexed_item(indexed_sales, item_id, store_id)
     if len(item_df) < MIN_ROWS_PER_SERIES:
         logger.warning("Skipping %s @ %s — only %s rows (need %s).",
                        item_id, store_id, len(item_df), MIN_ROWS_PER_SERIES)
@@ -132,6 +177,7 @@ def run_one(sales_clean, item_id, store_id, args):
         'safety_stock': inv['safety_stock'],
         'mape': eval_results['mape'] if eval_results else None,
         'rmse': eval_results['rmse'] if eval_results else None,
+        'mase': eval_results.get('mase') if eval_results else None,
     }
 
 
@@ -153,6 +199,17 @@ def print_summary(results, elapsed, n_failed, n_skipped):
     print(f"Elapsed:              {elapsed / 60:.1f} min "
           f"({elapsed / max(len(df), 1):.1f}s per run)")
 
+    with_mase = df[df['mase'].notna()]
+    if not with_mase.empty:
+        beat = (with_mase['mase'] < 1.0).sum()
+        pct = 100 * beat / len(with_mase)
+        print(f"\nMASE  — median {with_mase['mase'].median():.2f}  "
+              f"mean {with_mase['mase'].mean():.2f}  "
+              f"best {with_mase['mase'].min():.2f}  "
+              f"worst {with_mase['mase'].max():.2f}")
+        print(f"        {beat}/{len(with_mase)} ({pct:.0f}%) beat the seasonal naive baseline "
+              f"(MASE < 1.0)")
+
     if not with_mape.empty:
         print(f"\nMAPE  — median {with_mape['mape'].median():.1f}%  "
               f"mean {with_mape['mape'].mean():.1f}%  "
@@ -168,6 +225,16 @@ def print_summary(results, elapsed, n_failed, n_skipped):
             print("\nMAPE by demand volume:")
             print(f"  >= 1.5 units/day (n={len(high)}): median {high['mape'].median():.1f}%")
             print(f"  <  1.5 units/day (n={len(low)}):  median {low['mape'].median():.1f}%")
+
+    if not with_mase.empty:
+        h = with_mase[with_mase['avg_daily_demand'] >= 1.5]
+        lo = with_mase[with_mase['avg_daily_demand'] < 1.5]
+        if not h.empty and not lo.empty:
+            print("\nMASE by demand volume:")
+            print(f"  >= 1.5 units/day (n={len(h)}): median {h['mase'].median():.2f}  "
+                  f"({100 * (h['mase'] < 1.0).sum() / len(h):.0f}% beat naive)")
+            print(f"  <  1.5 units/day (n={len(lo)}):  median {lo['mase'].median():.2f}  "
+                  f"({100 * (lo['mase'] < 1.0).sum() / len(lo):.0f}% beat naive)")
 
     # Variability vs volume: the ISE point the app's compare tab makes for a
     # single pair, checked here across the whole sweep.
@@ -193,6 +260,11 @@ def main():
                         help="Forecast the N highest-demand products in each store")
     parser.add_argument('--sample', type=int,
                         help="Forecast a random sample of N products per store")
+    parser.add_argument('--stratified', type=int, metavar='N',
+                        help="Forecast N products from each decile of average demand "
+                             "(10 x N runs total). Balanced coverage across the whole "
+                             "demand spectrum, unlike --sample which follows the "
+                             "catalog's own skew toward low-volume items.")
     parser.add_argument('--seed', type=int, default=42,
                         help="Random seed for --sample (default: 42)")
     parser.add_argument('--stores', nargs='+',
@@ -217,6 +289,7 @@ def main():
 
     try:
         combos = select_combinations(sales_clean, top_n=args.top_n, sample=args.sample,
+                                     stratified=args.stratified,
                                      stores=args.stores, seed=args.seed)
     except ValueError as e:
         logger.error(str(e))
@@ -237,6 +310,8 @@ def main():
 
     logger.info("Forecasting %s combination(s). This is sequential and can take a "
                 "while; it is safe to interrupt and resume.", len(combos))
+    logger.info("Building series index for fast lookups ...")
+    indexed_sales = build_series_index(sales_clean)
 
     results, n_failed = [], 0
     start = time.time()
@@ -244,7 +319,7 @@ def main():
     for i, (item_id, store_id) in enumerate(combos, start=1):
         logger.info("[%s/%s] %s @ %s", i, len(combos), item_id, store_id)
         try:
-            result = run_one(sales_clean, item_id, store_id, args)
+            result = run_one(indexed_sales, item_id, store_id, args)
             if result is not None:
                 results.append(result)
         except ForecastingError as e:
