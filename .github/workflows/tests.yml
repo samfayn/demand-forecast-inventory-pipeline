@@ -53,4 +53,4 @@ jobs:
           pip install pyflakes
 
       - name: Check for unused imports, undefined names, and other issues
-        run: pyflakes src/ tests/ app.py
+        run: pyflakes src/ tests/ scripts/ app.py
