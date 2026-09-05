@@ -1,5 +1,9 @@
 # Demand Forecasting & Inventory Optimization
 
+[![Tests](https://github.com/samfayn/demand-forecast-inventory-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/samfayn/demand-forecast-inventory-pipeline/actions/workflows/tests.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A data preparation pipeline and interactive forecasting app that turns raw M5 retail
 data into inventory policies, with forecast accuracy validated by holdout backtesting
 and every run persisted to a queryable SQL database.
