@@ -199,12 +199,12 @@ with tab1:
                 )
             elif mape > 40:
                 st.info(
-                    f"**Note on this MAPE:** Retail demand forecasting at the individual item level "
-                    f"is genuinely difficult. The M5 dataset (real Walmart data) is a well-known "
-                    f"benchmark where even competition-winning ensemble models achieve MAPEs in this "
-                    f"range. A single-item Prophet model capturing weekly and yearly seasonality is "
-                    f"the right tool for interpretable, actionable forecasts — the backtest chart "
-                    f"below shows whether the model is tracking the right patterns."
+                    "**Note on this MAPE:** Retail demand forecasting at the individual item level "
+                    "is genuinely difficult. The M5 dataset (real Walmart data) is a well-known "
+                    "benchmark where even competition-winning ensemble models achieve MAPEs in this "
+                    "range. A single-item Prophet model capturing weekly and yearly seasonality is "
+                    "the right tool for interpretable, actionable forecasts — the backtest chart "
+                    "below shows whether the model is tracking the right patterns."
                 )
  
             comp = eval_results['comparison']
