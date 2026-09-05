@@ -1,3 +1,9 @@
+# Development and test dependencies. Includes everything in requirements.txt.
 -r requirements.txt
-pytest
-pytest-cov
+
+pytest>=7.0
+pytest-cov>=4.0
+pyflakes>=3.0
+
+# Needed to run the notebooks in notebooks/, not by the app itself.
+jupyter>=1.0

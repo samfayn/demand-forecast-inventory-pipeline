@@ -1,9 +1,18 @@
-pandas
-numpy
-scipy
-matplotlib
-prophet
-streamlit
-pyarrow
-jupyter
-duckdb
+# Runtime dependencies for the Streamlit app and the pipeline scripts.
+# Lower bounds rather than exact pins: loose enough not to fight an existing
+# environment, tight enough that a rebuild can't silently pick up a version
+# from before the APIs this project uses were stable.
+#
+# Jupyter is deliberately absent — it's only needed for the notebooks, so it
+# lives in requirements-dev.txt. Streamlit Community Cloud installs from this
+# file, and pulling the whole Jupyter tree into a deployment would slow every
+# build for no benefit.
+
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+prophet>=1.1
+streamlit>=1.30
+pyarrow>=14.0
+duckdb>=1.0
