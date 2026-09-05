@@ -9,6 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from pipeline import (load_data, get_single_item, prepare_prophet_df,
                       train_forecast, evaluate_forecast, calculate_inventory,
                       save_results_to_db, load_all_runs, load_run_forecast,
+                      get_run_summary,
                       ForecastingError, DatabaseError,
                       PARQUET_PATH, USING_DEMO_DATA,
                       STORE_LABELS, STORES_BY_STATE, STATE_LABELS,
@@ -617,31 +618,51 @@ with tab3:
         "Query, filter, and re-inspect past runs here — no re-running Prophet needed."
     )
  
-    all_runs = load_all_runs(limit=200)
- 
-    if all_runs.empty:
+    # Summary figures are aggregated in SQL across every saved run. The table
+    # below loads only a slice, so computing these from that slice would
+    # describe the visible page rather than the full history.
+    summary = get_run_summary()
+
+    if summary is None:
         st.info("No saved runs yet. Run a forecast in **📈 Single Product** "
                 "or **🔍 Compare Products** to populate this tab.")
         st.stop()
- 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Runs Saved", len(all_runs))
-    k2.metric("Unique Products", int(all_runs['item_id'].nunique()))
-    k3.metric("Unique Stores", int(all_runs['store_id'].nunique()))
 
-    valid_mase = all_runs['mase'].dropna() if 'mase' in all_runs.columns else pd.Series(dtype=float)
-    if not valid_mase.empty:
-        beat_naive = (valid_mase < 1.0).sum()
-        k4.metric("Median MASE", f"{valid_mase.median():.2f}",
-                  help="Below 1.0 beats a seasonal naive forecast.")
-        k5.metric("Beat naive baseline", f"{beat_naive}/{len(valid_mase)}",
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total Runs Saved", f"{summary['total_runs']:,}")
+    k2.metric("Unique Products", f"{summary['unique_items']:,}")
+    k3.metric("Unique Stores", summary['unique_stores'])
+
+    if summary['runs_with_mase']:
+        k4.metric("Median MASE", f"{summary['median_mase']:.2f}",
+                  help="Across all saved runs. Below 1.0 beats a seasonal naive forecast.")
+        pct = 100 * summary['beat_naive'] / summary['runs_with_mase']
+        k5.metric("Beat naive baseline",
+                  f"{summary['beat_naive']:,}/{summary['runs_with_mase']:,}",
+                  delta=f"{pct:.0f}%", delta_color="off",
                   help="Runs where the model outperformed seasonal naive.")
     else:
         k4.metric("Median MASE", "N/A",
                   help="Re-run the batch script to populate MASE for saved runs.")
-        valid_mapes = all_runs['mape'].dropna()
         k5.metric("Median MAPE",
-                  f"{valid_mapes.median():.1f}%" if not valid_mapes.empty else "N/A")
+                  f"{summary['median_mape']:.1f}%" if summary['runs_with_mape'] else "N/A")
+
+    st.divider()
+
+    row_limit = st.select_slider(
+        "Rows to load into the table below",
+        options=[100, 200, 500, 1000, 5000],
+        value=200,
+        help="The summary above always covers every saved run. This only controls "
+             "how many rows are loaded for filtering and sorting.")
+
+    all_runs = load_all_runs(limit=row_limit)
+
+    if len(all_runs) < summary['total_runs']:
+        st.caption(
+            f"Showing the {len(all_runs):,} most recent of {summary['total_runs']:,} "
+            f"saved runs. Filters and sorting below apply to these rows only — "
+            f"raise the limit to search the full history.")
  
     st.divider()
  

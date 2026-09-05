@@ -5,6 +5,8 @@ tests elsewhere, these genuinely hit a database — but always a temp one
 real data/inventory.duckdb, so running the test suite can never corrupt or
 wipe real saved runs.
 """
+import os
+
 import pandas as pd
 import pytest
 
@@ -173,3 +175,112 @@ def test_query_runs_raises_database_error_on_corrupt_file(tmp_path, monkeypatch)
 
     with pytest.raises(DatabaseError):
         query_runs(store_id='CA_1')
+
+# ---------------------------------------------------------------------------
+# get_run_summary — aggregates must cover every run, not just a loaded page
+# ---------------------------------------------------------------------------
+
+def test_run_summary_counts_all_runs_not_just_the_load_limit():
+    """Regression test: the Saved Results tab used to compute its totals from
+    load_all_runs(limit=200), so a database with more runs than the limit
+    reported the limit as the total. Summary figures must come from SQL over
+    the whole table."""
+    from pipeline import get_run_summary
+
+    for i in range(250):
+        save_results_to_db(f'ITEM_{i:03d}', 'CA_1', make_fake_inv(1.0 + i * 0.01),
+                            {'mape': 50.0, 'rmse': 1.0, 'mase': 0.5 + i * 0.004},
+                            90, 7, 10.0, 0.2, service_level=0.95)
+
+    summary = get_run_summary()
+    loaded = load_all_runs(limit=200)
+
+    assert summary['total_runs'] == 250
+    assert len(loaded) == 200, "load_all_runs should still respect its limit"
+    assert summary['unique_items'] == 250
+    assert summary['runs_with_mase'] == 250
+
+
+def test_run_summary_median_differs_from_truncated_slice():
+    """The summary should reflect the full distribution. With MASE rising
+    monotonically across runs, the newest 200 have a different median than
+    all 250, so equality would mean the summary is reading the slice."""
+    from pipeline import get_run_summary
+
+    for i in range(250):
+        save_results_to_db(f'ITEM_{i:03d}', 'CA_1', make_fake_inv(1.0),
+                            {'mape': 50.0, 'rmse': 1.0, 'mase': 0.2 + i * 0.01},
+                            90, 7, 10.0, 0.2, service_level=0.95)
+
+    summary = get_run_summary()
+    truncated_median = load_all_runs(limit=200)['mase'].median()
+
+    assert summary['median_mase'] != pytest.approx(truncated_median)
+
+
+def test_run_summary_beat_naive_counts_only_sub_one_mase():
+    from pipeline import get_run_summary
+
+    for i, mase in enumerate([0.5, 0.9, 1.0, 1.5, 0.99]):
+        save_results_to_db(f'ITEM_{i}', 'CA_1', make_fake_inv(1.0),
+                            {'mape': 50.0, 'rmse': 1.0, 'mase': mase},
+                            90, 7, 10.0, 0.2, service_level=0.95)
+
+    summary = get_run_summary()
+    assert summary['beat_naive'] == 3   # 0.5, 0.9, 0.99
+    assert summary['runs_with_mase'] == 5
+
+
+def test_run_summary_returns_none_for_empty_database():
+    from pipeline import get_run_summary
+    assert get_run_summary() is None
+
+
+def test_run_summary_raises_database_error_on_corrupt_file(tmp_path, monkeypatch):
+    from pipeline import get_run_summary
+
+    corrupt = tmp_path / "corrupt.duckdb"
+    corrupt.write_bytes(b"not a duckdb file")
+    monkeypatch.setattr(pipeline, "DB_PATH", str(corrupt))
+
+    with pytest.raises(DatabaseError):
+        get_run_summary()
+
+
+def test_data_path_resolution_prefers_full_then_demo(tmp_path, monkeypatch):
+    """The deployed app has no data/ directory, only the committed demo_data/.
+    Resolution must prefer the full dataset locally and fall back to the demo
+    subset when it's absent."""
+    monkeypatch.setattr(pipeline, "_REPO_ROOT", str(tmp_path))
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "demo_data").mkdir()
+
+    # neither present -> returns the full path, so the error message points at
+    # the file the user is expected to build
+    assert pipeline._resolve_data_path('full.parquet', 'demo.parquet').endswith(
+        os.path.join('data', 'full.parquet'))
+
+    # only demo present -> falls back
+    (tmp_path / "demo_data" / "demo.parquet").write_text("x")
+    assert pipeline._resolve_data_path('full.parquet', 'demo.parquet').endswith(
+        os.path.join('demo_data', 'demo.parquet'))
+
+    # both present -> prefers full
+    (tmp_path / "data" / "full.parquet").write_text("x")
+    assert pipeline._resolve_data_path('full.parquet', 'demo.parquet').endswith(
+        os.path.join('data', 'full.parquet'))
+
+
+def test_run_summary_returns_none_when_table_exists_but_is_empty(tmp_path, monkeypatch):
+    """Distinct from a missing database file: here the schema exists but no
+    runs have been saved, so COUNT(*) is 0 and the aggregates are all NULL."""
+    from pipeline import get_run_summary
+    import duckdb as ddb
+
+    db = tmp_path / "empty.duckdb"
+    with ddb.connect(str(db)) as con:
+        pipeline._init_db(con)
+    monkeypatch.setattr(pipeline, "DB_PATH", str(db))
+
+    assert get_run_summary() is None

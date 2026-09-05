@@ -381,6 +381,47 @@ def save_results_to_db(item_id, store_id, inv, eval_results,
         raise DatabaseError(f"Failed to save forecast run to database: {e}") from e
 
 
+def get_run_summary():
+    """
+    Aggregate statistics over *every* saved run, computed in SQL.
+
+    load_all_runs() caps how many rows it returns so the UI isn't rendering an
+    unbounded table. Computing summary figures from that capped result would
+    silently describe only the most recent page rather than the whole history,
+    so these are aggregated database-side where the limit doesn't apply.
+
+    Returns None when there's no database or no runs yet.
+    """
+    if not os.path.exists(DB_PATH):
+        return None
+
+    try:
+        with duckdb.connect(DB_PATH, read_only=True) as con:
+            row = con.execute("""
+                SELECT
+                    COUNT(*)                                       AS total_runs,
+                    COUNT(DISTINCT item_id)                        AS unique_items,
+                    COUNT(DISTINCT store_id)                       AS unique_stores,
+                    COUNT(mase)                                    AS runs_with_mase,
+                    MEDIAN(mase)                                   AS median_mase,
+                    COUNT(*) FILTER (WHERE mase < 1.0)             AS beat_naive,
+                    COUNT(mape)                                    AS runs_with_mape,
+                    MEDIAN(mape)                                   AS median_mape,
+                    MEDIAN(rmse)                                   AS median_rmse
+                FROM forecast_runs
+            """).fetchone()
+    except duckdb.Error as e:
+        raise DatabaseError(f"Failed to summarize saved runs: {e}") from e
+
+    if row is None or row[0] == 0:
+        return None
+
+    keys = ['total_runs', 'unique_items', 'unique_stores', 'runs_with_mase',
+            'median_mase', 'beat_naive', 'runs_with_mape', 'median_mape',
+            'median_rmse']
+    return dict(zip(keys, row))
+
+
 def load_all_runs(limit=200):
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
