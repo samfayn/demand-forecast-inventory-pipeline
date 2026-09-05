@@ -65,6 +65,11 @@ QUERIES = {
         'needs_runs': True,
         'title': 'Forecast accuracy vs demand intermittency',
     },
+    'mase_outlier_diagnosis': {
+        'needs_parquet': False,
+        'needs_runs': True,
+        'title': 'MASE outliers: genuine failures or degenerate scale factors?',
+    },
 }
 
 
