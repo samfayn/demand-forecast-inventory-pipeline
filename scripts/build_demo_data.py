@@ -14,7 +14,7 @@ The demo data is committed to the repository (see .gitignore), unlike the
 full dataset which stays local.
 
 Usage:
-    python scripts/build_demo_data.py
+    python scripts/build_demo_data.py --all-stores --max-pairs 150
     python scripts/build_demo_data.py --max-pairs 500
 """
 import argparse
@@ -55,7 +55,7 @@ def forecast_pairs(db_path, max_pairs=None):
     return df
 
 
-def build(full_parquet, full_db, max_pairs=None):
+def build(full_parquet, full_db, max_pairs=None, all_stores=False):
     for path, what in [(full_parquet, 'cleaned Parquet'), (full_db, 'forecast database')]:
         if not os.path.exists(path):
             raise SystemExit(
@@ -67,14 +67,23 @@ def build(full_parquet, full_db, max_pairs=None):
     if pairs.empty:
         raise SystemExit("No saved forecast runs — nothing to build a demo from.")
 
-    wanted = set(zip(pairs['item_id'], pairs['store_id']))
-
     logger.info("Reading %s ...", full_parquet)
     df = pd.read_parquet(full_parquet)
     logger.info("Full dataset: %s rows", f"{len(df):,}")
 
-    mask = pd.Series(list(zip(df['item_id'], df['store_id']))).isin(wanted)
-    demo = df[mask.values].copy()
+    if all_stores:
+        # Keep every store that stocks each selected item, not just the
+        # store it happened to be forecast at. Without this, most items in
+        # the demo exist at a single store, so the comparison tab (which
+        # needs two products sharing one store) almost always has nothing
+        # to offer.
+        wanted_items = set(pairs['item_id'])
+        demo = df[df['item_id'].isin(wanted_items)].copy()
+        logger.info("Keeping all stores for %s item(s).", len(wanted_items))
+    else:
+        wanted = set(zip(pairs['item_id'], pairs['store_id']))
+        mask = pd.Series(list(zip(df['item_id'], df['store_id']))).isin(wanted)
+        demo = df[mask.values].copy()
 
     if demo.empty:
         raise SystemExit(
@@ -114,9 +123,14 @@ def main():
     parser.add_argument('--db', default=FULL_DB)
     parser.add_argument('--max-pairs', type=int, default=None,
                         help="Cap the number of item/store pairs to keep")
+    parser.add_argument('--all-stores', action='store_true',
+                        help="Keep every store that stocks each selected item, not "
+                             "just the store it was forecast at. Larger output, but "
+                             "makes the comparison tab usable — it needs two products "
+                             "sharing one store.")
     args = parser.parse_args()
 
-    build(args.parquet, args.db, args.max_pairs)
+    build(args.parquet, args.db, args.max_pairs, args.all_stores)
 
 
 if __name__ == '__main__':

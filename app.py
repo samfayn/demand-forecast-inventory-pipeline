@@ -78,17 +78,48 @@ def _available_departments(cat_id):
     return sorted(DEPT_LABELS[d] for d in DEPT_LABELS if d in present)
 
 
-def _available_stores(state_id):
-    """Stores in a state that have items in the loaded dataset."""
-    present = set(sales_clean['store_id'].unique())
-    return [s for s in STORES_BY_STATE[state_id] if s in present]
+@st.cache_data
+def _item_store_pairs(df):
+    """Every (item_id, store_id) combination present in the dataset.
+
+    Not every product is stocked at every store: the pipeline's pre-launch
+    filter drops periods before an item existed at a given store, so roughly
+    a fifth of combinations are absent even in the full dataset, and far more
+    in the trimmed demo subset. The selectors use this to avoid offering a
+    combination that has no data behind it.
+    """
+    return set(zip(df['item_id'], df['store_id']))
 
 
-def _available_states():
-    present_stores = set(sales_clean['store_id'].unique())
+ITEM_STORE_PAIRS = _item_store_pairs(sales_clean)
+
+
+def _stores_with_items(item_ids):
+    """Stores carrying every item in item_ids.
+
+    With two products (the comparison tab) this is the intersection, since
+    that tab holds the store constant to isolate demand differences.
+    """
+    if not item_ids:
+        return set(sales_clean['store_id'].unique())
+    stores = None
+    for item in item_ids:
+        carried = {s for (i, s) in ITEM_STORE_PAIRS if i == item}
+        stores = carried if stores is None else stores & carried
+    return stores or set()
+
+
+def _available_stores(state_id, item_ids=None):
+    """Stores in a state that carry the selected item(s)."""
+    valid = _stores_with_items(item_ids)
+    return [s for s in STORES_BY_STATE[state_id] if s in valid]
+
+
+def _available_states(item_ids=None):
+    valid = _stores_with_items(item_ids)
     return sorted(
         STATE_LABELS[s] for s in STATE_LABELS
-        if any(store in present_stores for store in STORES_BY_STATE[s])
+        if any(store in valid for store in STORES_BY_STATE[s])
     )
 
 
@@ -137,13 +168,18 @@ def render_product_selector(key_prefix, sidebar=False, label_suffix="", cat_inde
     return product_id, cat_id
 
 
-def render_store_selector(key_prefix, sidebar=False, containers=None):
+def render_store_selector(key_prefix, sidebar=False, containers=None, item_ids=None):
     """
     Render the State -> Store cascade and return (store_id, store_label).
 
     containers, if given, is a (state_container, store_container) tuple — two
     st.columns(), for instance — letting the caller control layout. Without it,
     both render into the sidebar or into the main body depending on `sidebar`.
+
+    item_ids restricts the options to stores that carry those products, so a
+    visitor can't select a combination the dataset has no rows for. Returns
+    (None, None) when no store carries all of them, which the caller should
+    handle rather than proceeding to forecast.
     """
     if containers is not None:
         state_container, store_container = containers
@@ -159,11 +195,15 @@ def render_store_selector(key_prefix, sidebar=False, containers=None):
                                        label_visibility="collapsed", key=key)
         return container.selectbox(label, options, key=key)
 
-    state_label = selectbox(state_container, "State", _available_states(),
+    state_options = _available_states(item_ids)
+    if not state_options:
+        return None, None
+
+    state_label = selectbox(state_container, "State", state_options,
                             key=f"{key_prefix}_state")
     state_id = {v: k for k, v in STATE_LABELS.items()}[state_label]
 
-    store_ids = _available_stores(state_id)
+    store_ids = _available_stores(state_id, item_ids)
     short_options = [STORE_SHORT_LABELS[s] for s in store_ids]
     store_short = selectbox(store_container, "Store", short_options,
                             key=f"{key_prefix}_store")
@@ -200,7 +240,13 @@ with tab1:
     product_id, cat_id = render_product_selector("t1", sidebar=True)
 
     st.sidebar.header("① Store Selection")
-    store_id, selected_store_label = render_store_selector("t1", sidebar=True)
+    store_id, selected_store_label = render_store_selector(
+        "t1", sidebar=True, item_ids=[product_id])
+
+    if store_id is None:
+        st.sidebar.error("No store carries this product in the loaded dataset.")
+        st.error("This product has no store data available. Please select another.")
+        st.stop()
  
     st.sidebar.header("Inventory Parameters")
     lead_time = st.sidebar.slider("Lead Time (days)", 1, 30, 7)
@@ -462,7 +508,17 @@ with tab2:
 
     st.markdown("#### Shared Store")
     scol1, scol2, _ = st.columns([1, 1, 2])
-    cmp_store_id, cmp_store_label = render_store_selector("cmp", containers=(scol1, scol2))
+    cmp_store_id, cmp_store_label = render_store_selector(
+        "cmp", containers=(scol1, scol2), item_ids=[product_a_id, product_b_id])
+
+    if cmp_store_id is None:
+        st.warning(
+            f"**{product_a_id}** and **{product_b_id}** aren't both stocked at any "
+            f"single store in this dataset, so there's no shared store to compare "
+            f"them at. Pick a different pair — products from the same department "
+            f"are more likely to overlap."
+        )
+        st.stop()
  
     st.divider()
  
@@ -557,7 +613,7 @@ with tab2:
         }
  
         cmp_df = pd.DataFrame(comparison_data)
-        st.dataframe(cmp_df.set_index("Metric"), use_container_width=True)
+        st.dataframe(cmp_df.set_index("Metric"), width='stretch')
  
         demand_ratio = inv_a['avg_daily_demand'] / max(inv_b['avg_daily_demand'], 0.01)
         higher_label = product_a_id if demand_ratio >= 1 else product_b_id
@@ -714,7 +770,7 @@ with tab3:
     }
     st.dataframe(
         filtered[list(display_cols.keys())].rename(columns=display_cols),  # type: ignore[call-overload]
-        use_container_width=True,
+        width='stretch',
         hide_index=True
     )
  

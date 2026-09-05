@@ -14,5 +14,5 @@ scipy>=1.10
 matplotlib>=3.7
 prophet>=1.1
 streamlit>=1.30
-pyarrow>=14.0
+pyarrow>=14.0,<25   # 25.x has a known segfault (apache/arrow#50471)
 duckdb>=1.0
