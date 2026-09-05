@@ -101,6 +101,27 @@ def train_forecast(df_prophet, forecast_days=90):
         ) from e
 
 
+def compute_backtest_metrics(comparison):
+    """
+    Pure function: given a comparison DataFrame with 'y' (actual) and 'yhat'
+    (predicted, already clipped to >= 0) columns, computes MAPE and RMSE.
+
+    MAPE is computed only over rows where actual sales > 0, since percentage
+    error is undefined at zero and intermittent retail demand contains many
+    zero-sales days. RMSE uses all rows. Returns None if there are no
+    nonzero-actual rows to compute MAPE over.
+    """
+    nonzero = comparison[comparison['y'] > 0]
+
+    if len(nonzero) == 0:
+        return None
+
+    mape = (np.abs(nonzero['y'] - nonzero['yhat']) / nonzero['y']).mean() * 100
+    rmse = np.sqrt(((comparison['y'] - comparison['yhat']) ** 2).mean())
+
+    return {'mape': mape, 'rmse': rmse}
+
+
 def evaluate_forecast(df_prophet, holdout_days=90):
     """
     Holdout backtest: train on all data except the last holdout_days,
@@ -136,17 +157,13 @@ def evaluate_forecast(df_prophet, holdout_days=90):
     comparison = actual_df.merge(holdout_forecast, on='ds', how='inner')
     comparison['yhat'] = comparison['yhat'].clip(lower=0)
 
-    nonzero = comparison[comparison['y'] > 0].copy()
-
-    if len(nonzero) == 0:
+    metrics = compute_backtest_metrics(comparison)
+    if metrics is None:
         return None
 
-    mape = (np.abs(nonzero['y'] - nonzero['yhat']) / nonzero['y']).mean() * 100
-    rmse = np.sqrt(((comparison['y'] - comparison['yhat']) ** 2).mean())
-
     return {
-        'mape': mape,
-        'rmse': rmse,
+        'mape': metrics['mape'],
+        'rmse': metrics['rmse'],
         'comparison': comparison,
         'holdout_days': holdout_days
     }
