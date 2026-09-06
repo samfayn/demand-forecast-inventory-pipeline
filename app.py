@@ -50,13 +50,24 @@ sales_clean = load_cached_data()
  
 @st.cache_data
 def get_product_demand_summary(df):
-    """Avg daily demand per item across all stores, used to sort dropdowns."""
+    """Avg daily demand per item across all stores, used to sort dropdowns.
+
+    sales_clean stores its identifier columns as categoricals to keep the full
+    dataset inside the deployment's memory budget, but this summary is one row
+    per item (a few hundred), so the memory saving is irrelevant here while the
+    categorical dtype actively gets in the way: building display labels means
+    concatenating these values with strings, which a Categorical won't do.
+    Casting back to plain strings keeps that constraint inside the data layer
+    where it belongs.
+    """
     summary = (
-        df.groupby(['item_id', 'cat_id', 'dept_id'])['sales']
+        df.groupby(['item_id', 'cat_id', 'dept_id'], observed=True)['sales']
         .mean()
         .reset_index()
         .rename(columns={'sales': 'avg_daily_demand'})
     )
+    for col in ('item_id', 'cat_id', 'dept_id'):
+        summary[col] = summary[col].astype(str)
     return summary
  
 demand_summary = get_product_demand_summary(sales_clean)

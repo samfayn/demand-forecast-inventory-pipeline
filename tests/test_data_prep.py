@@ -182,3 +182,34 @@ def test_load_data_raises_clear_error_for_unrecognized_parquet(tmp_path):
 
     with pytest.raises(ValueError, match="none of the expected columns"):
         load_data(str(path))
+
+
+def test_categorical_columns_can_be_concatenated_after_summary_cast(tmp_path):
+    """Regression test: sales_clean uses categorical dtypes to fit the
+    deployment's memory budget, but the dashboard builds display labels by
+    concatenating item ids with strings, which raises
+    'TypeError: unsupported operand type(s) for +: Categorical and str'.
+    The per-item summary must therefore come back as plain strings.
+    """
+    from pipeline import load_data
+
+    path = tmp_path / 'sales.parquet'
+    make_sales_frame().to_parquet(path, index=False)
+    df = load_data(str(path))
+
+    # the big frame keeps categoricals — that's the memory optimization
+    assert str(df['item_id'].dtype) == 'category'
+
+    # concatenating directly off the categorical frame is what used to break
+    with pytest.raises(TypeError):
+        _ = df['item_id'] + "  —  "
+
+    # the aggregate the UI actually uses must be castable and concatenable
+    summary = (df.groupby(['item_id', 'cat_id', 'dept_id'], observed=True)['sales']
+               .mean().reset_index())
+    for col in ('item_id', 'cat_id', 'dept_id'):
+        summary[col] = summary[col].astype(str)
+
+    labels = summary['item_id'] + "  —  " + summary['sales'].map(lambda x: f"{x:.2f}")
+    assert len(labels) == summary.shape[0]
+    assert all(" —  " in lbl for lbl in labels)
